@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Python 语法
+        run: python -m py_compile server.py mcp_server.py voice_engines.py voice_models.py voice_services.py smoke.py dsh_link.py
+
+      - name: 前端语法
+        run: node --check client.js
+
+      - name: 宿主自检（路由 / 端口发现）
+        run: node panel-selftest.mjs
+
+      - name: 前端自检（三个插槽注册）
+        run: node client-selftest.mjs

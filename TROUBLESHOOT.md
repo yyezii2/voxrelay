@@ -178,6 +178,15 @@ MCP 默认读 `config.json` 的 `port`。如果你手动设了环境变量 `VOIC
 
 MCP 是启动时加载的，**改完配置要重启一次客户端**才会生效。
 
+**开关不生效？** 先分清是哪一层：
+
+- 面板显示已关闭、但还有声音 → 旧版服务没有总闸。升级后 `enabled=false` 会让所有带
+  `X-VoiceHub-Auto: 1` 的请求直接回 `204`，绕过 MCP 直连 HTTP 也拦得住。
+- 开关打开、AI 却不念 → 看客户端有没有 `conversation.chat.turnTail` 插槽。新版面板会在
+  回合结束时自己朗读，不依赖模型调 `speak`；老版客户端没这个插槽，只能靠 MCP 握手时下发的
+  `instructions`。
+- 改完 `mcp_server.py` / `client.js`：MCP 要重启客户端，前端要重启 DSH。
+
 ---
 
 ## 9. 侧边栏面板连不上服务

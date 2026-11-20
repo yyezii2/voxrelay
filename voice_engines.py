@@ -351,21 +351,42 @@ def _cache_key(voice_id, text, speed, rvc_model, pitch):
 
 
 def cleanup_cache():
+    """按 TTL + 大小上限清理缓存。
+
+    - TTL：`cache.max_age_days`，默认 7 天；0 表示不按时间清
+    - 大小：`cache.max_mb`，默认 300MB，超了删到 60%
+    """
     cfg = _CFG.get("cache", {})
     if not cfg.get("enabled", True):
         return
+    if not os.path.isdir(CACHE_DIR):
+        return
     limit = int(cfg.get("max_mb", 300)) * 1024 * 1024
+    try:
+        max_age = float(cfg.get("max_age_days", 7))
+    except (TypeError, ValueError):
+        max_age = 7.0
+    deadline = time.time() - max_age * 86400 if max_age > 0 else 0
+
     files = []
     total = 0
     for name in os.listdir(CACHE_DIR):
         p = os.path.join(CACHE_DIR, name)
-        if os.path.isfile(p):
+        if not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if deadline and st.st_mtime < deadline:
             try:
-                sz = os.path.getsize(p)
-            except OSError:
+                os.remove(p)
                 continue
-            files.append((os.path.getmtime(p), p, sz))
-            total += sz
+            except OSError:
+                pass
+        files.append((st.st_mtime, p, st.st_size))
+        total += st.st_size
+
     if total <= limit:
         return
     files.sort()
@@ -377,6 +398,22 @@ def cleanup_cache():
             total -= sz
         except OSError:
             pass
+
+
+_LAST_CLEANUP = 0.0
+
+
+def _maybe_cleanup(interval=3600):
+    """运行中也清，不再只靠启动那一次；每小时最多跑一次。"""
+    global _LAST_CLEANUP
+    now = time.time()
+    if now - _LAST_CLEANUP < interval:
+        return
+    _LAST_CLEANUP = now
+    try:
+        cleanup_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=True):
@@ -396,6 +433,7 @@ def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=Tru
         for ext in ("mp3", "wav", "ogg", "flac"):
             cand = os.path.join(CACHE_DIR, "%s.%s" % (ck, ext))
             if os.path.exists(cand) and os.path.getsize(cand) > 128:
+                _maybe_cleanup()
                 return {
                     "path": cand,
                     "ext": ext,
@@ -459,6 +497,7 @@ def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=Tru
         except OSError:
             pass
 
+    _maybe_cleanup()
     return {
         "path": path,
         "ext": ext,

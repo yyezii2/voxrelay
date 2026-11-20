@@ -88,6 +88,49 @@ GSV_HINT = (
     "需要 AI 帮忙装的话，直接跟它说一声就行。"
 )
 
+INSTRUCTIONS_PANEL = (
+    "本机语音约定（由 voicehub 服务下发）：\n"
+    "- 当前客户端有 VoxRelay 面板，它会在每次回复结束后自动朗读，"
+    "**不要主动调用 speak**，否则同一段会念两遍。\n"
+    "- 只有用户明确要求「念一下这段 / 读出来」时才调用 speak。\n"
+    "- 开关与音色由面板和服务端统一管理。"
+)
+
+INSTRUCTIONS_MCP = (
+    "本机语音约定（由 voicehub 服务下发，不需要在 agent 规则文件里重复）：\n"
+    "- 每次回复完成后调用 speak 朗读正文要点，不超过 300 字；不念代码块、表格、路径、长数字。\n"
+    "- 语音模式关闭时 speak 静默返回，所以可以放心每次都调用。\n"
+    "- 固定口令：打开mod1 / 关闭mod1 / 别念了 / 换声音。\n"
+    "- 开关与音色由服务端统一管理，面板和 MCP 改的是同一份 voice_mode.json。"
+)
+
+
+def _instructions_for(params):
+    """有侧边栏面板的客户端（DSH）让面板自己念，别让模型再调一次。
+
+    其他客户端（WorkBuddy 等）没有面板，只能靠模型每轮调 speak。
+    判据是 MCP initialize 里的 clientInfo.name。
+    """
+    info = (params or {}).get("clientInfo") or {}
+    name = str(info.get("name") or "").lower()
+    if any(k in name for k in ("dsh", "deepseek", "harness")):
+        return INSTRUCTIONS_PANEL
+    return INSTRUCTIONS_MCP
+
+
+def _note_client(params):
+    """记下谁在连，方便确认 clientInfo 名字有没有变。"""
+    try:
+        info = (params or {}).get("clientInfo") or {}
+        folder = os.path.join(ROOT, "logs")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "mcp-clients.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                info.get("name") or "?", info.get("version") or "?"))
+    except Exception:  # noqa: BLE001
+        pass
+
 TOOLS = [
     {
         "name": "speak",
@@ -174,7 +217,7 @@ def _post(path, payload, timeout=180):
     req = urllib.request.Request(
         _base() + path,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-VoiceHub-Auto": "1"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -621,10 +664,14 @@ def handle(msg):
     mid = msg.get("id")
 
     if method == "initialize":
+        params = msg.get("params") or {}
+        _note_client(params)
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "voicehub", "version": "1.1.0"},
+            "serverInfo": {"name": "voicehub", "version": "0.1.0"},
+            # 规则随握手下发：有面板的客户端让面板念，没有的让模型调 speak
+            "instructions": _instructions_for(params),
         }}
     if method in ("notifications/initialized", "initialized"):
         return None

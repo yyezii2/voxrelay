@@ -80,6 +80,9 @@ curl -X POST http://127.0.0.1:8787/v1/audio/speech \
 请求体字段：`input`（或 `text`）、`voice`、`speed`、`response_format`、`model`。
 超过 `max_chars` 会被拒绝，避免一次塞一本书进来。
 
+自动朗读请带 `X-VoiceHub-Auto: 1`（等价于请求体 `"auto": true`）：语音模式关闭时服务端
+直接回 `204`，不合成、不出声。手动试听不要带，否则开关关着就听不到了。
+
 ## 带自己的音色
 
 模型不进仓库。把目录丢进 `models/` 就行，服务启动自动扫描：
@@ -124,10 +127,29 @@ stdio 传输、零依赖，DSH 和 WorkBuddy 都能直接挂：
 端口自动从 `config.json` 读，不用在 MCP 配置里写地址。
 只有当服务不在本机、或者你想故意指到别处时，才需要设 `VOICEHUB_BASE`。
 
+握手（`initialize`）时会按客户端下发不同的 `instructions`：
+
+- **带侧边栏面板的客户端（DSH）**：`不要主动调用 speak`——面板会在回合结束时自己念，
+  模型再调一次就念两遍了。
+- **没有面板的客户端（WorkBuddy 等）**：每轮回复后调用 `speak` 朗读要点。
+
+规则跟着服务走，不用在 DSH / WorkBuddy 各自的 agent 规则文件里再抄一遍。
+
 ## DSH 侧边栏面板（可选）
 
 面板和 MCP 改的是同一份 `voice_mode.json`：AI 说「打开语音」，面板 4 秒内自己刷成开启；
 在面板上关掉，AI 也不再念。两边不会打架。
+
+**开关是服务端总闸，不是提示词约定。** `enabled=false` 时，所有带 `X-VoiceHub-Auto: 1`
+（或 `auto:true`）的合成请求都会被直接回 `204`、不合成不出声——包括绕过 MCP 直连 HTTP 的
+agent。手动试听和明确调用不带这个头，照常出声。
+
+**自动朗读由前端触发。** 面板在 `conversation.chat.turnTail`（回合尾部）挂了一个朗读组件：
+回复一结束，前端自己取正文、合成、播放，不再等模型记得调 `speak`。开关一动立刻生效；
+打开历史会话不会重念旧消息；同一段文本在一个会话里只念一次。
+
+老版本 DSH 没有这个插槽时，注册失败会自动跳过，退化成「只靠 MCP 工具」——不会报错，
+也不会让面板消失。
 
 安装（只是把包登记进 DSH，不会重装服务）：
 
@@ -164,11 +186,14 @@ node_modules 链接 -> D:\你的路径\voxrelay
 面板自己的自检（不需要启动 DSH）：
 
 ```bash
-node panel-selftest.mjs
+node panel-selftest.mjs    # 宿主半边：路由、端口发现
+node client-selftest.mjs   # 前端：三个插槽是否都注册上（含回合尾部朗读）
 ```
 
-它会检查包名和客户端 id 是否一致、`apply()` 能否注册路由、端点算出来的端口是否与
-`config.json` 对得上——这三条任一不满足，面板就会静默不出现。
+`panel-selftest.mjs` 检查包名和客户端 id 是否一致、`apply()` 能否注册路由、端点算出来的端口
+是否与 `config.json` 对得上——这三条任一不满足，面板就会静默不出现。
+`client-selftest.mjs` 用一个假 ctx 走一遍真实加载路径，确认 `main`、`sidebar.panellist`、
+`conversation.chat.turnTail` 都注册成功；少一个，对应的功能就静默缺失。
 
 ## 目录
 
@@ -180,11 +205,12 @@ voice_services.py    三个服务的启停、自愈、端口解析
 mcp_server.py        MCP 封装
 smoke.py             冒烟测试（另起临时实例自检）
 index.js             面板宿主半边：/voicehub/endpoint，告诉前端服务在哪
-client.js            面板前端（浏览器里跑的那半，手写 React.createElement）
+client.js            面板前端 + 回合结束自动朗读（手写 React.createElement）
 cordis.patch.yml     DSH 插入项：把面板挂进侧边栏
 package.json         一个包两个身份：npm 包清单 + DSH 插件声明
 dsh_link.py          把本包登记进 DSH profile / 撤销
 panel-selftest.mjs   面板自检（假 ctx 走一遍真实加载路径）
+client-selftest.mjs  前端自检（确认 main / 侧边栏 / 回合尾部三个插槽都注册上）
 TROUBLESHOOT.md      按症状查的排查手册
 config.example.json  默认配置（缺 config.json 时自动用它）
 start.bat stop.bat   Windows 启停脚本
@@ -194,8 +220,14 @@ models/              你自己的音色模型放这里
 ## 已知限制
 
 - **Windows 优先**。SAPI 引擎和 `start.bat` 是 Windows 的，其他平台只剩 edge-tts 一档。
-- 缓存按 `sha1(音色|语速|文本)` 存 `out/cache/`，超 `cache.max_mb` 自动清。
+- 缓存按 `sha1(音色|语速|文本)` 存 `out/cache/`：超过 `cache.max_mb`（默认 300MB）或
+  超过 `cache.max_age_days`（默认 7 天）自动清。启动时清一次，运行中每小时补一次，
+  不需要手动删。
 - edge-tts 是微软的在线服务，需要联网；断网时自动退到 SAPI。
+- 前端自动朗读依赖 DSH 的 `conversation.chat.turnTail` 插槽；没有这个插槽的客户端
+  只能靠模型主动调 `speak`。两种路径都受同一个开关管。
+- 自动朗读只念 assistant 正文：去掉代码块、表格、URL，超过 300 字按句截断；
+  同一段文本在一个会话里只念一次，打开历史会话不重念。
 
 ## 许可
 

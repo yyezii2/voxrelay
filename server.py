@@ -42,7 +42,7 @@ import voice_services as VS  # noqa: E402
 LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "server.log")
-VERSION = "1.0.0"
+VERSION = "0.1.0"
 START_TS = time.time()
 
 # 实际监听的地址，main() 里填。重启时要用它拉新进程，
@@ -570,6 +570,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------- 核心
     def _speech(self, params, is_get=False):
         t0 = time.time()
+        # 自动朗读总闸：语音模式关闭时，凡标了 auto 的请求一律不出声。
+        # 以前只在 MCP 的 speak 里判断，绕过 MCP 直接打 HTTP 的 agent 照样会念。
+        auto = (self.headers.get("X-VoiceHub-Auto") == "1"
+                or str(params.get("auto") or "").lower() in ("1", "true", "yes"))
+        if auto and not _read_state().get("enabled", True):
+            return self._send(204, b"", "audio/wav", {"X-VoiceHub-Muted": "1"})
         text = (params.get("input") or params.get("text") or "").strip()
         if not text:
             return self._err(400, "缺少 input / text 字段")

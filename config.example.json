@@ -5,7 +5,8 @@
   "default_voice": "xiaoxiao",
   "cache": {
     "enabled": true,
-    "max_mb": 300
+    "max_mb": 300,
+    "max_age_days": 7
   },
   "engines": {
     "edge": {

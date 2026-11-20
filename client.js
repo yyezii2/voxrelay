@@ -103,6 +103,152 @@ window.__ModuleLoader__.load({
 
       const STACK_NAMES = { voicehub: "VoiceHub", gsv: "GSV", rvc: "RVC" };
 
+      // ---------------- 回合结束自动朗读（不依赖 agent 规则） ----------------
+      // 开关仍以 voice_mode.json 的 enabled 为准；这里只解决「谁来触发」。
+      // 面板轮询、MCP 工具、前端三处读的是同一份状态，谁改都立刻生效。
+      const BOOT_AT = Date.now();
+      let currentAudio = null;
+
+      function hashText(s) {
+        let h = 5381;
+        for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+        return (h >>> 0).toString(36) + "-" + s.length;
+      }
+
+      function looksLikeCode(s) {
+        if (/^\s*[\[{]/.test(s)) return true;
+        if (s.indexOf("```") >= 0) return true;
+        if (/^(https?:\/\/|\/|[A-Za-z]:\\)/.test(s)) return true;
+        return false;
+      }
+
+      // 从 turn 里挖出 assistant 的正文。DSH 不同版本的 turn 结构不完全一样，
+      // 这里按「role 优先、字符串兜底」递归找，取最长的一段。
+      function extractReply(turn) {
+        const out = [];
+        const seen = new Set();
+        const push = (s, role) => {
+          if (typeof s !== "string") return;
+          s = s.trim();
+          if (s.length < 8 || s.length > 4000) return;
+          if (looksLikeCode(s)) return;
+          if (!/[\u4e00-\u9fa5]/.test(s) && s.length < 40) return;
+          if (seen.has(s)) return;
+          seen.add(s);
+          out.push({ text: s, role: role });
+        };
+        const walk = (v, role, depth) => {
+          if (depth > 8 || out.length > 80) return;
+          if (typeof v === "string") return push(v, role);
+          if (!v || typeof v !== "object") return;
+          const r = typeof v.role === "string" ? v.role : role;
+          if (typeof v.get === "function" && typeof v.forEach === "function") {
+            try { v.forEach((val) => walk(val, r, depth + 1)); } catch (e) { /* 忽略 */ }
+            return;
+          }
+          if (Array.isArray(v)) { v.forEach((x) => walk(x, r, depth + 1)); return; }
+          Object.keys(v).forEach((k) => {
+            if (k === "meta" || k === "usage" || k === "id" || k === "sessionId") return;
+            try { walk(v[k], r, depth + 1); } catch (e) { /* 忽略 */ }
+          });
+        };
+        walk(turn, "assistant", 0);
+        const asst = out.filter((x) => x.role !== "user");
+        const pool = asst.length ? asst : out;
+        if (!pool.length) return "";
+        pool.sort((a, b) => b.text.length - a.text.length);
+        return pool[0].text;
+      }
+
+      // 回合时间戳：用来区分「新回复」和「打开历史会话时重放的旧回合」。
+      function turnTime(turn) {
+        const pick = (o) => {
+          if (!o || typeof o !== "object") return 0;
+          const keys = ["createdAt", "updatedAt", "startedAt", "time", "timestamp", "ts"];
+          for (let i = 0; i < keys.length; i++) {
+            let v;
+            try { v = typeof o.get === "function" ? o.get(keys[i]) : o[keys[i]]; } catch (e) { continue; }
+            if (typeof v === "number" && v > 1e12) return v;
+            if (typeof v === "string") {
+              const t = Date.parse(v);
+              if (!isNaN(t)) return t;
+            }
+          }
+          return 0;
+        };
+        let t = pick(turn);
+        if (!t) { try { t = pick(turn && turn.data); } catch (e) { t = 0; } }
+        return t || 0;
+      }
+
+      function trimForSpeech(text, max) {
+        text = String(text || "").replace(/\s+/g, " ").trim();
+        if (text.length <= max) return text;
+        const cut = text.slice(0, max);
+        const p = Math.max(
+          cut.lastIndexOf("。"), cut.lastIndexOf("！"),
+          cut.lastIndexOf("？"), cut.lastIndexOf("；"),
+        );
+        return p > max * 0.6 ? cut.slice(0, p + 1) : cut;
+      }
+
+      async function speakTurn(turn, sessionId) {
+        try {
+          const m = await call("/v1/mode");
+          if (!m || !m.enabled) return;
+          const text = trimForSpeech(extractReply(turn), 300);
+          if (!text) return;
+
+          const h = hashText(text);
+          const key = "voxrelay.spoken." + (sessionId || "default");
+          let arr = [];
+          try { arr = JSON.parse(sessionStorage.getItem(key) || "[]"); } catch (e) { arr = []; }
+          if (arr.indexOf(h) >= 0) return;
+          arr.push(h);
+          if (arr.length > 60) arr = arr.slice(-60);
+          try { sessionStorage.setItem(key, JSON.stringify(arr)); } catch (e) { /* 忽略 */ }
+
+          const res = await fetch(BASE + "/v1/audio/speech", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-VoiceHub-Auto": "1" },
+            body: JSON.stringify({ input: text, voice: m.voice }),
+          });
+          if (!res.ok) return;
+          const blob = await res.blob();
+          if (!blob || blob.size < 500) return;
+
+          try { if (currentAudio) currentAudio.pause(); } catch (e) { /* 忽略 */ }
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          currentAudio = audio;
+          audio.onended = function () {
+            URL.revokeObjectURL(url);
+            if (currentAudio === audio) currentAudio = null;
+          };
+          audio.play().catch(function () { /* 浏览器拦截自动播放时静默 */ });
+        } catch (e) {
+          /* 朗读失败不影响聊天 */
+        }
+      }
+
+      // 挂在每个回合的尾部：回合结束才渲染，正好是「说完再念」的时机。
+      function AutoSpeak(props) {
+        const fired = React.useRef(false);
+        React.useEffect(() => {
+          if (fired.current) return;
+          fired.current = true;
+          // 有回合时间戳就以它为准：一分钟前的旧回合是历史重放，不念。
+          // 拿不到时间才退回「页面刚加载 3 秒内算历史」。
+          const when = turnTime(props.turn);
+          if (when ? Date.now() - when > 60000 : Date.now() - BOOT_AT < 3000) return;
+          const t = setTimeout(function () {
+            speakTurn(props.turn, props.sessionId);
+          }, 700);
+          return function () { clearTimeout(t); };
+        }, []);
+        return null;
+      }
+
       function Panel() {
         const [mode, setMode] = React.useState(null);
         const [voices, setVoices] = React.useState([]);
@@ -533,6 +679,7 @@ window.__ModuleLoader__.load({
         // DSH 启动时 main 插槽要等外壳 UI 初始化后才声明，早注册会报
         // 「slot main is not declared」。带重试，等它就绪，否则偶发侧边栏不出现。
         let mainDone = false;
+        let autoDone = false;
         const attempt = function (n) {
           try {
             const slots = ctx.get("slots");
@@ -544,6 +691,19 @@ window.__ModuleLoader__.load({
             if (!mainDone) {
               slots.register({ name: "main", key: PANEL, inject: () => ({}) }, Panel);
               mainDone = true;
+            }
+            if (!autoDone) {
+              // 回合尾部插槽：插件自己触发朗读，不再等 agent 记得调工具。
+              // 老版本 DSH 没有这个插槽，注册失败就退化为原行为。
+              try {
+                slots.inject("conversation.chat.turnTail", () => slots.register(
+                  { name: "conversation.chat.turnTail", id: PANEL + "-autospeak", inject: () => ({}) },
+                  AutoSpeak,
+                ));
+                autoDone = true;
+              } catch (e) {
+                /* 没有该插槽：忽略 */
+              }
             }
             slots.inject("sidebar.panellist", () => slots.register(
               { name: "sidebar.panellist", id: PANEL, order: 6, label: () => "语音" },
