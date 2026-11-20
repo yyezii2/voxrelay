@@ -198,18 +198,50 @@ MCP 是启动时加载的，**改完配置要重启一次客户端**才会生效
 
 **先重启一次 DSH**。面板和 MCP 都是启动时加载的。
 
-重启后还是没有：
+重启后还是没有，先让脚本告诉你挂没挂上：
 
-1. 确认插件在 `~/.dsh/profiles/desktop/package.json` 的 `dsh.profile.bundles` 里有一行 `@local/voicehub-panel`
-2. 确认 `node_modules/@local/voicehub-panel` 是个能打开的软链
-3. 还是不行，把插件宿主侧退回空实现，确认是不是插件本身的问题：
+```bash
+python dsh_link.py status
+```
 
-   ```bash
-   echo 'export function apply() {}' > "<插件目录>/index.js"
-   ```
+输出里四行都要对：
 
-   重启后面板回来了，说明是宿主侧那段注册路由的代码有问题（它只负责"自动发现端口"，
-   退掉之后面板依然能用，只是要手填地址）。
+```
+profile      C:\Users\你\.dsh\profiles\desktop
+依赖         link:D:/你的路径/voxrelay
+bundles      有
+node_modules 链接 -> D:\你的路径\voxrelay
+```
+
+哪一行不对就重挂一次（改之前会自动备份清单）：
+
+```bash
+python dsh_link.py register
+```
+
+还是不行，把插件宿主侧退回空实现，确认是不是插件本身的代码问题：
+
+```bash
+echo 'export function apply() {}' > index.js
+```
+
+重启后面板回来了，说明是宿主侧注册路由那段的问题（它只负责"自动发现端口"，
+退掉之后面板依然能用，只是要手填地址）。别忘了把 `index.js` 从 git 恢复回来。
+
+---
+
+## 11. 面板出现两个，或者名字还是旧的
+
+旧版面板叫 `@local/voicehub-panel`，新版叫 `voxrelay`。升级时如果两套都在 profile 里，
+就会挂两个面板。
+
+```bash
+python dsh_link.py status   # 看现在挂的是哪个
+python dsh_link.py register # 会清掉旧依赖、把旧插入项就地换成 voxrelay
+```
+
+然后重启 DSH。旧面板的目录（比如 `default-workspace\voicehub-panel`）可以删了，
+但**要先确认 profile 里已经没有 `@local/voicehub-panel`**——删早了面板会整个消失。
 
 ---
 

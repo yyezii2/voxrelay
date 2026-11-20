@@ -9,6 +9,7 @@ POST http://127.0.0.1:8787/v1/audio/speech
 ```
 
 - 五个 Python 文件，标准库实现，没有 Web 框架；MCP 和侧边栏面板都是可选的
+- 一个仓库就是一个包：`package.json` 管 DSH 插件，`server.py` 管服务，共用同一份 `config.json`
 - 引擎可叠：edge-tts（免费在线）→ Windows SAPI（离线兜底）→ 上游服务 → RVC 后处理
 - 任何一个引擎挂掉都会被降级绕过，**保证一定有声音出来**
 - 音色由你自己带，仓库不含任何模型（见 [models/README.md](models/README.md)）
@@ -28,6 +29,12 @@ start.bat
 端口取自 `config.json` 的 `port`，改了要按新地址打开。
 
 装完直接有 11 个音色（10 个微软在线音色 + 1 个系统 SAPI），够用再往下看。
+
+面板不是必需的。想在 DSH 侧边栏里开关语音，安装时多带一个开关，然后重启 DSH：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -RegisterDsh
+```
 
 出问题了先跑自检，它会逐项告诉你是哪一环坏了：
 
@@ -117,6 +124,52 @@ stdio 传输、零依赖，DSH 和 WorkBuddy 都能直接挂：
 端口自动从 `config.json` 读，不用在 MCP 配置里写地址。
 只有当服务不在本机、或者你想故意指到别处时，才需要设 `VOICEHUB_BASE`。
 
+## DSH 侧边栏面板（可选）
+
+面板和 MCP 改的是同一份 `voice_mode.json`：AI 说「打开语音」，面板 4 秒内自己刷成开启；
+在面板上关掉，AI 也不再念。两边不会打架。
+
+安装（只是把包登记进 DSH，不会重装服务）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -RegisterDsh
+```
+
+它只动三样东西，改之前都会备份 profile 清单：
+
+1. 在 `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 里加一行
+   `"voxrelay": "link:<本仓库绝对路径>"`，并在 `dsh.profile.bundles` 里加 `voxrelay`
+2. 把 `node_modules/voxrelay` 指向本仓库（软链，失败则退回目录联接）
+3. 清掉旧版 `@local/voicehub-panel` 的残留依赖和插入项
+
+**然后重启 DSH** —— 宿主只在启动时读 profile。侧边栏出现面板就是成功。
+撤掉用 `install.ps1 -UnregisterDsh`，服务本身不受影响。
+
+不想用脚本就手动改：照上面三条来，`bundles` 里加一行 `voxrelay` 即可。
+改完可以先用 `python dsh_link.py status` 看挂没挂对：
+
+```
+profile      C:\Users\你\.dsh\profiles\desktop
+依赖         link:D:/你的路径/voxrelay
+bundles      有
+node_modules 链接 -> D:\你的路径\voxrelay
+结论         已挂上
+```
+
+**面板怎么找到服务**：宿主半边（`index.js`）注册了同源接口 `/voicehub/endpoint`，
+优先读服务启动时写的 `endpoint.json`（带 pid 校验，服务被强杀留下的死文件不会被采纳），
+没有才退回 `config.json` 的 `port`。所以改端口只需重启服务，面板下次轮询自己跟上，
+不用改面板配置、也不用重启 DSH。
+
+面板自己的自检（不需要启动 DSH）：
+
+```bash
+node panel-selftest.mjs
+```
+
+它会检查包名和客户端 id 是否一致、`apply()` 能否注册路由、端点算出来的端口是否与
+`config.json` 对得上——这三条任一不满足，面板就会静默不出现。
+
 ## 目录
 
 ```
@@ -126,6 +179,12 @@ voice_models.py      models/ 自动发现
 voice_services.py    三个服务的启停、自愈、端口解析
 mcp_server.py        MCP 封装
 smoke.py             冒烟测试（另起临时实例自检）
+index.js             面板宿主半边：/voicehub/endpoint，告诉前端服务在哪
+client.js            面板前端（浏览器里跑的那半，手写 React.createElement）
+cordis.patch.yml     DSH 插入项：把面板挂进侧边栏
+package.json         一个包两个身份：npm 包清单 + DSH 插件声明
+dsh_link.py          把本包登记进 DSH profile / 撤销
+panel-selftest.mjs   面板自检（假 ctx 走一遍真实加载路径）
 TROUBLESHOOT.md      按症状查的排查手册
 config.example.json  默认配置（缺 config.json 时自动用它）
 start.bat stop.bat   Windows 启停脚本
