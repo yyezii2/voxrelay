@@ -1,0 +1,123 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "max_chars": 3000,
+  "default_voice": "xiaoxiao",
+  "cache": {
+    "enabled": true,
+    "max_mb": 300
+  },
+  "engines": {
+    "edge": {
+      "enabled": true
+    },
+    "sapi": {
+      "enabled": true
+    },
+    "upstream": {
+      "enabled": false,
+      "base_url": "http://127.0.0.1:9880/v1",
+      "api_key": "",
+      "model": "gpt-sovits",
+      "voice": "default",
+      "format": "wav"
+    },
+    "gsv": {
+      "enabled": false,
+      "base_url": "http://127.0.0.1:9880",
+      "text_lang": "zh",
+      "prompt_lang": "ja",
+      "text_split_method": "cut5",
+      "media_type": "wav",
+      "timeout": 180,
+      "sample_steps": 32,
+      "speed_factor": 1.3,
+      "ref_audio": "",
+      "prompt_text": ""
+    }
+  },
+  "rvc": {
+    "enabled": false,
+    "worker": "http://127.0.0.1:8790",
+    "timeout": 180
+  },
+  "voices": {
+    "xiaoxiao": {
+      "name": "晓晓",
+      "engine": "edge",
+      "tts_voice": "zh-CN-XiaoxiaoNeural",
+      "language": "zh-CN",
+      "desc": "女声，自然温和，默认音色"
+    },
+    "xiaoyi": {
+      "name": "晓伊",
+      "engine": "edge",
+      "tts_voice": "zh-CN-XiaoyiNeural",
+      "language": "zh-CN",
+      "desc": "女声，年轻活泼"
+    },
+    "yunxi": {
+      "name": "云希",
+      "engine": "edge",
+      "tts_voice": "zh-CN-YunxiNeural",
+      "language": "zh-CN",
+      "desc": "男声，年轻清亮"
+    },
+    "yunjian": {
+      "name": "云健",
+      "engine": "edge",
+      "tts_voice": "zh-CN-YunjianNeural",
+      "language": "zh-CN",
+      "desc": "男声，低沉有力，适合解说"
+    },
+    "yunyang": {
+      "name": "云扬",
+      "engine": "edge",
+      "tts_voice": "zh-CN-YunyangNeural",
+      "language": "zh-CN",
+      "desc": "男声，播音腔"
+    },
+    "xiaobei": {
+      "name": "小北",
+      "engine": "edge",
+      "tts_voice": "zh-CN-liaoning-XiaobeiNeural",
+      "language": "zh-CN",
+      "desc": "女声，东北口音"
+    },
+    "xiaoni": {
+      "name": "小妮",
+      "engine": "edge",
+      "tts_voice": "zh-CN-shaanxi-XiaoniNeural",
+      "language": "zh-CN",
+      "desc": "女声，陕西口音"
+    },
+    "hiu": {
+      "name": "晓曼",
+      "engine": "edge",
+      "tts_voice": "zh-HK-HiuMaanNeural",
+      "language": "zh-HK",
+      "desc": "粤语女声"
+    },
+    "hsiao": {
+      "name": "晓臻",
+      "engine": "edge",
+      "tts_voice": "zh-TW-HsiaoChenNeural",
+      "language": "zh-TW",
+      "desc": "台湾腔女声"
+    },
+    "aria": {
+      "name": "Aria",
+      "engine": "edge",
+      "tts_voice": "en-US-AriaNeural",
+      "language": "en-US",
+      "desc": "英文女声"
+    },
+    "system": {
+      "name": "系统音色",
+      "engine": "sapi",
+      "tts_voice": "",
+      "language": "zh-CN",
+      "desc": "Windows 本机语音，完全离线，断网可用"
+    }
+  }
+}

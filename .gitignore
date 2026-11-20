@@ -1,0 +1,22 @@
+.venv/
+runtime/
+vendor/
+config.json
+voice_mode.json
+volume.json
+# 运行时状态：用户自选的组件安装位置、自愈意图，各机器不一样
+stack.json
+services.json
+# 本进程实际监听的地址，面板据此自动发现端口
+endpoint.json
+logs/
+out/
+__pycache__/
+*.pyc
+*.log
+
+# 模型不进仓库：用户自己的音色放在这里
+models/gsv/*/
+models/rvc/*/
+!models/gsv/.gitkeep
+!models/rvc/.gitkeep
