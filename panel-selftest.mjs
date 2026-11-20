@@ -10,10 +10,10 @@
  *
  * 退出码 0 = 通过。
  */
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NAME = JSON.parse(readFileSync(join(HERE, "package.json"), "utf8")).name;
@@ -113,16 +113,61 @@ check("非 GET 被拒", () => {
   return "405";
 });
 
-check("端点算出来的端口与 config.json 一致", () => {
-  const res = fakeRes();
-  globalThis.__route.handler({ method: "GET" }, res);
-  const data = res.json();
-  const cfg = JSON.parse(readFileSync(join(HERE, "config.json"), "utf8").replace(/^\uFEFF/, ""));
-  if (data.port !== Number(cfg.port)) throw new Error(`接口 ${data.port} vs 配置 ${cfg.port}`);
-  return String(data.port);
+/** 某个目录里的端口：优先 endpoint.json（本进程 pid 保证是活的），其次 config。 */
+function portOf(home) {
+  const read = (name) => JSON.parse(readFileSync(join(home, name), "utf8").replace(/^\uFEFF/, ""));
+  try {
+    return { port: Number(read("endpoint.json").port), src: "endpoint.json" };
+  } catch {
+    /* 没有 endpoint.json，往下走 */
+  }
+  for (const name of ["config.json", "config.example.json"]) {
+    try {
+      return { port: Number(read(name).port), src: name };
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return null;
+}
+
+check("环境变量指到哪，端点就跟到哪", () => {
+  // 造一个假的服务目录：endpoint.json 里的 pid 用当前进程，保证 pid 校验能过
+  const home = mkdtempSync(join(tmpdir(), "voxrelay-selftest-"));
+  writeFileSync(join(home, "endpoint.json"),
+    JSON.stringify({ host: "127.0.0.1", port: 19999, pid: process.pid }));
+
+  const prev = process.env.VOICEHUB_HOME;
+  process.env.VOICEHUB_HOME = home;
+  try {
+    const res = fakeRes();
+    globalThis.__route.handler({ method: "GET" }, res);
+    const got = res.json();
+    if (got.home !== home) throw new Error(`home 是 ${got.home}，不是环境变量指的目录`);
+    if (got.port !== 19999) throw new Error(`端口是 ${got.port}，应该 19999`);
+    return "19999（endpoint.json）";
+  } finally {
+    if (prev === undefined) delete process.env.VOICEHUB_HOME;
+    else process.env.VOICEHUB_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
-check("仓库里 config.example.json 可解析", () => {
+check("端点返回的端口和它那个目录的配置自洽", () => {
+  // 不假定本机服务在哪：返回哪个目录，就用那个目录的配置核对
+  const res = fakeRes();
+  globalThis.__route.handler({ method: "GET" }, res);
+  const got = res.json();
+  if (!got || !got.home) throw new Error("没算出服务目录: " + JSON.stringify(got));
+  const expect = portOf(got.home);
+  if (!expect) throw new Error(`${got.home} 里既没有 endpoint.json 也没有 config`);
+  if (got.port !== expect.port) {
+    throw new Error(`${got.home}: 接口 ${got.port} vs ${expect.src} ${expect.port}`);
+  }
+  return `${got.home} → ${got.port}（${expect.src}）`;
+});
+
+check("config.example.json 可解析", () => {
   const cfg = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8").replace(/^\uFEFF/, ""));
   if (!cfg.port) throw new Error("没有 port");
   return "port " + cfg.port;
