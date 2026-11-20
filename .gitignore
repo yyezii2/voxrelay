@@ -20,3 +20,6 @@ models/gsv/*/
 models/rvc/*/
 !models/gsv/.gitkeep
 !models/rvc/.gitkeep
+
+# DSH 把本包 link 进 profile 时会生成
+node_modules/

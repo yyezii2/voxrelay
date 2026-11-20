@@ -1,0 +1,26 @@
+{
+  "name": "voxrelay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地语音服务（OpenAI 兼容）+ DSH 侧边栏面板 + MCP 工具，一个包。Python 管服务，package.json 管 DSH 插件。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "start": "python server.py",
+    "smoke": "python smoke.py"
+  },
+  "license": "MIT"
+}
