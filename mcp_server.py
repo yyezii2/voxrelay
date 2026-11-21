@@ -36,6 +36,11 @@ STATE = os.environ.get("VOICEHUB_STATE", os.path.join(ROOT, "voice_mode.json"))
 PROTOCOL = "2024-11-05"
 DEFAULT_VOICE = "xiaoxiao"
 
+# 当前连着的客户端身份（stdio 是单客户端连接，initialize 时记录一次）。
+# 用来区分「有面板的 DSH」和「没面板的 WorkBuddy」：只有前者在 speech_mode=panel
+# 时才该静默 speak，后者（没面板）必须永远能念，否则整个 WorkBuddy 就没声音了。
+_LAST_CLIENT = ""
+
 CREATE_NO_WINDOW = 0x08000000
 # 脱离父进程：否则父进程（MCP 服务）一退出，拉起的服务会被一起干掉
 DETACHED_PROCESS = 0x00000008
@@ -105,6 +110,16 @@ INSTRUCTIONS_MCP = (
 )
 
 
+def _is_panel_client(name=None):
+    """这个客户端有没有 DSH 侧边栏面板（会自己自动朗读）。
+
+    有面板的客户端（DSH）在 speech_mode=panel 时不该再调 speak，否则双念；
+    没面板的客户端（WorkBuddy 等）无论 speech_mode 是什么都得能念。
+    """
+    n = str(name if name is not None else _LAST_CLIENT).lower()
+    return any(k in n for k in ("dsh", "deepseek", "harness"))
+
+
 def _instructions_for(params):
     """朗读来源（speech_mode）决定 agent 该不该主动念，读 voice_mode.json 现算。
 
@@ -118,7 +133,7 @@ def _instructions_for(params):
     # 兜底：语音来源不是 mcp 时，再按客户端名判断——有面板就别让模型念。
     info = (params or {}).get("clientInfo") or {}
     name = str(info.get("name") or "").lower()
-    if any(k in name for k in ("dsh", "deepseek", "harness")):
+    if _is_panel_client(name):
         return INSTRUCTIONS_PANEL
     return INSTRUCTIONS_MCP
 
@@ -315,9 +330,10 @@ def speak(text, voice=None):
     st = _load_state()
     if not st["enabled"]:
         return "语音模式已关闭，这段话没有朗读。需要开就说“打开语音”。"
-    # 朗读来源是「面板」时，agent 不该再主动念——面板会在回合结束自动朗读，
-    # 这里静默返回，避免同一段被念两遍。用户在面板里切到「MCP 朗读」后这里才真正出声。
-    if (st.get("speech_mode") or "panel") == "panel":
+    # 朗读来源是「面板」时，只有「有面板的 DSH 客户端」才该静默——面板会在回合结束
+    # 自动朗读，agent 再念就两遍。没面板的客户端（WorkBuddy 等）没有 turnTail 面板，
+    # 必须靠 speak 出声，否则整个客户端就哑了；所以这里绝不能一刀切静默。
+    if (st.get("speech_mode") or "panel") == "panel" and _is_panel_client():
         return "朗读由面板负责，本工具静默跳过（面板里可切到 MCP 朗读）。"
 
     want = voice or st["voice"]
@@ -707,6 +723,9 @@ def handle(msg):
     if method == "initialize":
         params = msg.get("params") or {}
         _note_client(params)
+        # 记住当前客户端身份，speak 据此判断「是不是有面板的 DSH」。
+        global _LAST_CLIENT
+        _LAST_CLIENT = str(((params or {}).get("clientInfo") or {}).get("name") or "")
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {}},
