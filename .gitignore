@@ -9,6 +9,8 @@ stack.json
 services.json
 # 本进程实际监听的地址，面板据此自动发现端口
 endpoint.json
+# 跨进程启停锁（service_lock 的运行时产物）
+services.lock
 logs/
 out/
 __pycache__/

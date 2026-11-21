@@ -17,6 +17,17 @@ from urllib.parse import urlparse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 IS_WIN = os.name == "nt"
 
+# 和 mcp_server 共用同一把跨进程锁：面板、MCP、/v1/service 的启停互相串行，
+# 避免「面板点停止」和「打开 mod1」同时进来抢端口。锁模块不可用时降级为不加锁。
+try:
+    from service_lock import service_lock
+except Exception:  # noqa: BLE001
+    from contextlib import contextmanager
+
+    @contextmanager
+    def service_lock(tag="", timeout=180):
+        yield False
+
 # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 # 让子进程脱离当前控制台，父进程退出（或终端关掉）不会把它带走。
 DETACHED = (0x00000008 | 0x00000200) if IS_WIN else 0
@@ -233,7 +244,7 @@ def status():
 
 # ---------------------------------------------------------------- 启停
 
-def start(name, wait=90):
+def _start_impl(name, wait=90):
     svc = get(name)
     ok, why = ready(svc)
     if not ok:
@@ -264,6 +275,12 @@ def start(name, wait=90):
     return {"ok": False, "name": svc["name"], "error": "启动超时"}
 
 
+def start(name, wait=90):
+    """对外的启动入口：先拿锁再执行。锁等超时会降级放行，不拦住操作。"""
+    with service_lock("start:%s" % name):
+        return _start_impl(name, wait)
+
+
 def _pids_on(port):
     if not IS_WIN:
         return set()
@@ -282,7 +299,7 @@ def _pids_on(port):
     return pids
 
 
-def stop(name, wait=20):
+def _stop_impl(name, wait=20):
     svc = get(name)
     if not IS_WIN:
         return {"ok": False, "name": svc["name"], "error": "当前系统不支持进程管理"}
@@ -309,10 +326,18 @@ def stop(name, wait=20):
     return {"ok": False, "name": svc["name"], "error": "端口 %d 未释放" % svc["port"]}
 
 
+def stop(name, wait=20):
+    """对外的停止入口：先拿锁再执行。"""
+    with service_lock("stop:%s" % name):
+        return _stop_impl(name, wait)
+
+
 def restart(name, wait=90):
-    stop(name)
-    time.sleep(0.5)
-    return start(name, wait=wait)
+    """重启只在最外层拿一次锁：内部走 _impl，否则会自己等自己（锁不可重入）。"""
+    with service_lock("restart:%s" % name):
+        _stop_impl(name)
+        time.sleep(0.5)
+        return _start_impl(name, wait=wait)
 
 
 # ---------------------------------------------------------------- 自愈意图

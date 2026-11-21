@@ -29,6 +29,17 @@ if ROOT not in sys.path:
 
 import voice_services as VS  # noqa: E402
 
+# 和 voice_services 共用同一把跨进程锁：面板、MCP、/v1/service 的启停互相串行，
+# 避免「面板点停止」和「打开 mod1」同时进来抢端口。锁模块不可用时降级为不加锁。
+try:
+    from service_lock import service_lock
+except Exception:  # noqa: BLE001
+    from contextlib import contextmanager
+
+    @contextmanager
+    def service_lock(tag="", timeout=180):
+        yield False
+
 # 端口只在 config.json 定义一次。这里刻意不缓存成常量：
 # MCP 是常驻进程，用户改完端口不该为了让它生效而重启整个客户端。
 # 每次请求现读，代价只是一次几 KB 的 JSON 解析。
@@ -460,7 +471,7 @@ def _service_ready(svc):
     return VS.ready(svc)
 
 
-def start_services(wait=180):
+def _start_services_impl(wait=180):
     """拉起服务并等端口就绪，返回 (已启动, 失败, 跳过)。
 
     缺失的 optional 服务跳过即可，不再中断整轮启动——
@@ -512,6 +523,12 @@ def start_services(wait=180):
     return started, failed, skipped
 
 
+def start_services(wait=180):
+    """对外入口：和面板 / `/v1/service` 共用一把锁，避免同时启停抢端口。"""
+    with service_lock("mcp:start-all"):
+        return _start_services_impl(wait)
+
+
 def _pids_on(port):
     try:
         out = subprocess.run(["netstat", "-ano"], capture_output=True,
@@ -528,7 +545,7 @@ def _pids_on(port):
     return pids
 
 
-def stop_services():
+def _stop_services_impl():
     killed = []
     for svc in SERVICES:
         for pid in _pids_on(svc["port"]):
@@ -539,6 +556,12 @@ def stop_services():
             except Exception:  # noqa: BLE001
                 pass
     return killed
+
+
+def stop_services():
+    """对外入口：同 start_services，共用一把锁。"""
+    with service_lock("mcp:stop-all"):
+        return _stop_services_impl()
 
 
 def _load_voices():
