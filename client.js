@@ -958,7 +958,11 @@ window.__ModuleLoader__.load({
         const stack = mode.stack || {};
 
         return h("div", {
-          style: { maxWidth: 640, padding: "28px 32px", fontSize: 14, color: C.text },
+          style: {
+            flex: 1, minHeight: 0, overflowY: "auto",
+            boxSizing: "border-box", maxWidth: 640, margin: "0 auto", width: "100%",
+            padding: "28px 32px", fontSize: 14, color: C.text,
+          },
         },
           h("div", { style: { fontSize: 16, fontWeight: 500, marginBottom: 4 } }, "语音"),
           h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 26 } },
