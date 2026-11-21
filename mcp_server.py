@@ -779,7 +779,23 @@ def handle(msg):
     return None
 
 
+def _cleanup_stale_temp(max_age=7200):
+    """清掉上次被强杀时没删掉的临时音频，避免 Temp 越攒越多。"""
+    import glob
+
+    now = time.time()
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "voxrelay_*")):
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def main():
+    # 先清掉历史残留的临时音频（强杀进程时 mkstemp 的文件不会被回收）
+    _cleanup_stale_temp()
+
     # MCP 走 UTF-8；Windows 下 Python 默认按 GBK 写管道，中文会变乱码
     try:
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
