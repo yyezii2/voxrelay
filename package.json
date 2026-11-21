@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nico2905120737-lab/voxrelay.git"
+  },
   "description": "本地语音服务（OpenAI 兼容）+ DSH 侧边栏面板 + MCP 工具，一个包。Python 管服务，package.json 管 DSH 插件。",
   "main": "./index.js",
   "exports": {

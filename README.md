@@ -19,7 +19,7 @@ POST http://127.0.0.1:8787/v1/audio/speech
 需要 Python 3.10+（Windows）。
 
 ```powershell
-git clone <this-repo> VoxRelay
+git clone https://github.com/nico2905120737-lab/voxrelay.git VoxRelay
 cd VoxRelay
 powershell -ExecutionPolicy Bypass -File install.ps1
 start.bat
