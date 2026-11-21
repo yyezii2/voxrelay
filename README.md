@@ -127,11 +127,13 @@ stdio 传输、零依赖，DSH 和 WorkBuddy 都能直接挂：
 端口自动从 `config.json` 读，不用在 MCP 配置里写地址。
 只有当服务不在本机、或者你想故意指到别处时，才需要设 `VOICEHUB_BASE`。
 
-握手（`initialize`）时会按客户端下发不同的 `instructions`：
+握手（`initialize`）时会按「朗读来源」（`speech_mode`）下发不同的 `instructions`：
 
-- **带侧边栏面板的客户端（DSH）**：`不要主动调用 speak`——面板会在回合结束时自己念，
-  模型再调一次就念两遍了。
-- **没有面板的客户端（WorkBuddy 等）**：每轮回复后调用 `speak` 朗读要点。
+- **`panel`（默认）**：面板在回合结束时自己念，`不要主动调用 speak`——模型再调一次就念两遍。
+- **`mcp`**：每轮回复后调用 `speak` 朗读要点，面板不自动念。
+
+`speech_mode` 存在 `voice_mode.json` 里，可在面板「朗读来源」处随时切换，或用
+`set_speech_mode` 工具切换（口令「让面板念 / 让 MCP 念」）。切完下一轮指令跟着变。
 
 规则跟着服务走，不用在 DSH / WorkBuddy 各自的 agent 规则文件里再抄一遍。
 
@@ -147,6 +149,9 @@ agent。手动试听和明确调用不带这个头，照常出声。
 **自动朗读由前端触发。** 面板在 `conversation.chat.turnTail`（回合尾部）挂了一个朗读组件：
 回复一结束，前端自己取正文、合成、播放，不再等模型记得调 `speak`。开关一动立刻生效；
 打开历史会话不会重念旧消息；同一段文本在一个会话里只念一次。
+
+**朗读来源可在面板切换**（`panel` 面板自动朗读 / `mcp` 由 AI 调 `speak`），
+与 MCP 的 `set_speech_mode` 是同一份状态，谁先改都行、两边自动同步。
 
 老版本 DSH 没有这个插槽时，注册失败会自动跳过，退化成「只靠 MCP 工具」——不会报错，
 也不会让面板消失。
@@ -182,6 +187,30 @@ node_modules 链接 -> D:\你的路径\voxrelay
 优先读服务启动时写的 `endpoint.json`（带 pid 校验，服务被强杀留下的死文件不会被采纳），
 没有才退回 `config.json` 的 `port`。所以改端口只需重启服务，面板下次轮询自己跟上，
 不用改面板配置、也不用重启 DSH。
+
+**服务没起时，面板能自己拉起来**。除了 `/voicehub/endpoint`，宿主还挂了三条控制路由：
+
+| 路由 | 作用 |
+|---|---|
+| `GET /voicehub/status` | 三件套状态 + 语音模式，**不依赖 8787** |
+| `POST /voicehub/service` | `{name:"GSV"\|"VoiceHub"\|"RVC", action:"start"\|"stop"\|"restart"}` |
+| `POST /voicehub/mode` | `{enabled:true\|false}`，总开关 |
+
+连不上 8787 时面板不会只剩一个"填地址"的空壳，而是显示「服务未运行」：列出三件套状态，
+给「启动语音（全套）」和每个组件的单独启动按钮。
+
+这些路由**不重写启停逻辑**——`start/stop` 转手调 `voice_services`，总开关转手调
+`mcp_server.set_voice_mode`，和「打开 mod1 / 关闭 mod1」、计划任务走的是同一套幂等逻辑、
+同一份状态（`services.json` 意图 + 端口实际）。组件名和动作都有白名单，宿主不接受任意命令。
+
+启停请求一律「立即返回、后台执行」：`start` 内部最长等 90 秒，同步等会把面板请求挂住，
+所以前端靠原有的 4 秒轮询看服务自己起来。
+
+**「关闭全部服务」**（面板底部「维护」区，要点两下确认）会停掉三个进程、关闭语音模式、释放显存。
+服务是 `DETACHED` 起的，DSH 关掉之后它们仍在后台跑 —— 要清干净就用这个按钮，不用去命令行。
+它走的是 `/voicehub/mode {enabled:false}` → `mcp_server.set_voice_mode` → `stop_services`，
+不自己实现停进程的逻辑。「服务未运行」页里也有一个「全部停止」，用来清掉 VoiceHub 掉了、
+但 GSV/RVC 还在吃显存的残局。
 
 面板自己的自检（不需要启动 DSH）：
 

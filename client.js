@@ -19,6 +19,13 @@ window.__ModuleLoader__.load({
       // 存进 localStorage，以后不用再填。
       const DEFAULT_BASE = "http://127.0.0.1:8787";
       const BASE_KEY = "voicehub.base";
+      // 这个标记区分「用户手填的」和「自动探测到的」：
+      // 手填的远程地址要尊重，不能被自动探测冲掉；手填的本机地址则放行，
+      // 因为端口变了本来就该跟着走。
+      const BASE_MANUAL_KEY = "voicehub.base.manual";
+      function isLocalBase(b) {
+        return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(String(b || ""));
+      }
       function readBase() {
         try { return localStorage.getItem(BASE_KEY) || DEFAULT_BASE; } catch (e) { return DEFAULT_BASE; }
       }
@@ -42,6 +49,21 @@ window.__ModuleLoader__.load({
         if (!res.ok) {
           const msg = (data && data.error && data.error.message) || "HTTP " + res.status;
           throw new Error(msg);
+        }
+        return data;
+      }
+
+      // 控制层：走宿主同源路由，8787 没起也能用。
+      // 宿主转手调 voice_services / mcp_server，不自己重写启停判断，
+      // 所以面板、MCP、计划任务操作的是同一份状态。
+      async function hostCall(path, body) {
+        const opt = body
+          ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+          : { cache: "no-store" };
+        const res = await fetch(path, opt);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error((data && data.error) || "HTTP " + res.status);
         }
         return data;
       }
@@ -106,8 +128,33 @@ window.__ModuleLoader__.load({
       // ---------------- 回合结束自动朗读（不依赖 agent 规则） ----------------
       // 开关仍以 voice_mode.json 的 enabled 为准；这里只解决「谁来触发」。
       // 面板轮询、MCP 工具、前端三处读的是同一份状态，谁改都立刻生效。
-      const BOOT_AT = Date.now();
       let currentAudio = null;
+      let currentAudioUrl = null;
+      // ticket 每来一个朗读请求就+1；gen 是真正获准合成的那一个。
+      // 新请求获准时 gen 跳到它，旧请求在 await 后发现自己过期就自己退场。
+      let ticket = 0;
+      let gen = 0;
+      let activeController = null;
+      // 同一 tick 里 DSH 会把历史回合整批重放；攒 700ms 一批，只念最新的那个。
+      let pendingTurns = [];
+      let batchTimer = null;
+      const firedKeys = new Set();
+      const seenSeq = new Map();
+      // 朗读来源：panel=面板自动朗读，mcp=agent 用 speak 念。面板轮询时更新，
+      // AutoSpeak 挂载时读它决定念不念，省一次 /v1/mode 请求。
+      let speechMode = "panel";
+
+      // 排查用：把朗读走到哪一步报给服务端（只发键名/长度/状态码，不发聊天正文）
+      function report(data) {
+        try {
+          fetch(BASE + "/v1/debug", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data),
+            keepalive: true,
+          }).catch(function () {});
+        } catch (e) { /* 忽略 */ }
+      }
 
       function hashText(s) {
         let h = 5381;
@@ -122,63 +169,179 @@ window.__ModuleLoader__.load({
         return false;
       }
 
-      // 从 turn 里挖出 assistant 的正文。DSH 不同版本的 turn 结构不完全一样，
-      // 这里按「role 优先、字符串兜底」递归找，取最长的一段。
-      function extractReply(turn) {
-        const out = [];
+      function storeGet(store, key) {
+        if (!store || typeof store.get !== "function") return undefined;
+        try { return store.get(key); } catch (e) { return undefined; }
+      }
+
+      function isTextBlock(b) {
+        if (!b || typeof b !== "object") return false;
+        const kind = b.kind || b.type;
+        return kind === "text" || kind === "output_text";
+      }
+
+      // DSH 的最终正文在 LocationDataStore 里，不在 turn 的顶层：
+      //   turn.data.get("turn-tail").closing.blocks  ← 回合收尾时挑好的最终回复
+      //   step.data.get("assistant-step").blocks     ← 逐步的 assistant 内容
+      // 这些块的字段是 kind（不是 type）：reasoning / text / tool-call / image。
+      // 之前只判 type，reasoning 块没被拦住，递归时把它的 text 当正文取走了。
+      function blockKinds(blocks) {
+        if (!Array.isArray(blocks)) return "";
+        const count = {};
+        blocks.forEach(function (b) {
+          const k = b && (b.kind || b.type) || "?";
+          count[k] = (count[k] || 0) + 1;
+        });
+        return Object.keys(count).map(function (k) { return k + ":" + count[k]; }).join(",");
+      }
+
+      function textFromBlocks(blocks) {
+        if (!Array.isArray(blocks)) return "";
+        // 与 DSH 的 assistantText() 一致：只拼 kind=text，顺序不变。
+        return blocks.filter(isTextBlock)
+          .map(function (b) { return typeof b.text === "string" ? b.text : ""; })
+          .join("").trim();
+      }
+
+      function speechText(s, min, max) {
+        if (typeof s !== "string") return "";
+        s = s.trim();
+        if (s.length < min || s.length > max) return "";
+        if (looksLikeCode(s)) return "";
+        if (!/[\u4e00-\u9fa5]/.test(s) && s.length < 40) return "";
+        return s;
+      }
+
+      function structuredReply(turn) {
+        if (!turn || typeof turn !== "object") return null;
+        const tail = storeGet(turn.data, "turn-tail");
+        if (tail && tail.closing && Array.isArray(tail.closing.blocks)) {
+          const text = speechText(textFromBlocks(tail.closing.blocks), 1, 4000);
+          if (text) return { text: text, source: "turn-tail", kinds: blockKinds(tail.closing.blocks) };
+        }
+        const steps = Array.isArray(turn.steps) ? turn.steps : [];
+        for (let i = steps.length - 1; i >= 0; i--) {
+          const a = storeGet(steps[i] && steps[i].data, "assistant-step");
+          if (!a || !Array.isArray(a.blocks) || a.finalNode === undefined) continue;
+          const text = speechText(textFromBlocks(a.blocks), 1, 4000);
+          if (text) return { text: text, source: "assistant-step:" + i, kinds: blockKinds(a.blocks) };
+        }
+        return null;
+      }
+
+      // 结构认不出来时的递归兜底。块对象按 kind/type 整块判定：
+      // 非 text 块（尤其 reasoning）直接 return，绝不往里递归取 text。
+      function walkSpeechStrings(root, min, max, limit) {
+        const found = [];
         const seen = new Set();
-        const push = (s, role) => {
-          if (typeof s !== "string") return;
-          s = s.trim();
-          if (s.length < 8 || s.length > 4000) return;
-          if (looksLikeCode(s)) return;
-          if (!/[\u4e00-\u9fa5]/.test(s) && s.length < 40) return;
-          if (seen.has(s)) return;
-          seen.add(s);
-          out.push({ text: s, role: role });
+        const push = function (s, role) {
+          const v = speechText(s, min, max);
+          if (!v || seen.has(v)) return;
+          seen.add(v);
+          found.push({ text: v, role: role });
         };
-        const walk = (v, role, depth) => {
-          if (depth > 8 || out.length > 80) return;
-          if (typeof v === "string") return push(v, role);
-          if (!v || typeof v !== "object") return;
-          const r = typeof v.role === "string" ? v.role : role;
-          if (typeof v.get === "function" && typeof v.forEach === "function") {
-            try { v.forEach((val) => walk(val, r, depth + 1)); } catch (e) { /* 忽略 */ }
+        const walk = function (v, role, depth) {
+          if (depth > 10 || found.length > limit) return;
+          if (typeof v === "string") {
+            const s = v.trim();
+            if (s.length > 1 && s.length < 8000 && (s.charAt(0) === "{" || s.charAt(0) === "[")) {
+              try {
+                const parsed = JSON.parse(s);
+                if (parsed && typeof parsed === "object") {
+                  walk(parsed, role, depth + 1);
+                  return;
+                }
+              } catch (e) { /* 按普通文本继续 */ }
+            }
+            push(v, role);
             return;
           }
-          if (Array.isArray(v)) { v.forEach((x) => walk(x, r, depth + 1)); return; }
-          Object.keys(v).forEach((k) => {
+          if (!v || typeof v !== "object") return;
+          const kind = typeof v.kind === "string" ? v.kind : (typeof v.type === "string" ? v.type : "");
+          if (kind) {
+            if (isTextBlock(v)) push(v.text, role);
+            return; // reasoning / tool-call / image / other 整块跳过
+          }
+          const r = typeof v.role === "string" ? v.role : role;
+          if (typeof v.get === "function" && typeof v.forEach === "function") {
+            try { v.forEach(function (val) { walk(val, r, depth + 1); }); } catch (e) { /* 忽略 */ }
+            return;
+          }
+          if (Array.isArray(v)) { v.forEach(function (x) { walk(x, r, depth + 1); }); return; }
+          Object.keys(v).forEach(function (k) {
             if (k === "meta" || k === "usage" || k === "id" || k === "sessionId") return;
+            if (/reason|think|thought|analysis|prompt|context|history|system|tool/i.test(k)) return;
             try { walk(v[k], r, depth + 1); } catch (e) { /* 忽略 */ }
           });
         };
-        walk(turn, "assistant", 0);
-        const asst = out.filter((x) => x.role !== "user");
-        const pool = asst.length ? asst : out;
-        if (!pool.length) return "";
-        pool.sort((a, b) => b.text.length - a.text.length);
-        return pool[0].text;
+        walk(root, "assistant", 0);
+        found.sort(function (a, b) { return b.text.length - a.text.length; });
+        return found;
+      }
+
+      function extractReplyInfo(turn) {
+        const structured = structuredReply(turn);
+        if (structured) return structured;
+        const found = walkSpeechStrings(turn, 8, 4000, 80);
+        const asst = found.filter(function (x) { return x.role !== "user"; });
+        const pool = asst.length ? asst : found;
+        return {
+          text: pool.length ? pool[0].text : "",
+          source: "walk",
+          kinds: "",
+        };
+      }
+
+      function extractReply(turn) {
+        return extractReplyInfo(turn).text;
+      }
+
+      // 兜底：结构认不出来时放宽长度，但仍走同一套「非 text 块不递归」规则。
+      function extractReplyLoose(turn) {
+        const structured = structuredReply(turn);
+        if (structured) return structured.text;
+        const found = walkSpeechStrings(turn, 12, 1200, 120);
+        return found.length ? found[0].text : "";
       }
 
       // 回合时间戳：用来区分「新回复」和「打开历史会话时重放的旧回合」。
-      function turnTime(turn) {
-        const pick = (o) => {
-          if (!o || typeof o !== "object") return 0;
-          const keys = ["createdAt", "updatedAt", "startedAt", "time", "timestamp", "ts"];
-          for (let i = 0; i < keys.length; i++) {
-            let v;
-            try { v = typeof o.get === "function" ? o.get(keys[i]) : o[keys[i]]; } catch (e) { continue; }
-            if (typeof v === "number" && v > 1e12) return v;
-            if (typeof v === "string") {
-              const t = Date.parse(v);
-              if (!isNaN(t)) return t;
-            }
+      // DSH 的 TurnLocation 是 {turn,start,end,status,steps,data}，start/end 是
+      // SessionEvent：{type,seq,time,data}，time 是 Unix 毫秒。原来只扫描 turn 的
+      // createdAt/... 一层，读不到这里，导致 when 恒为 0、历史回合全被当新的念。
+      // 结束时间优先：turnTail 只在回合 closed 后挂载，end.time 才是「刚说完」。
+      function eventTime(ev) {
+        if (!ev || typeof ev !== "object") return 0;
+        const keys = ["time", "timestamp", "ts", "createdAt", "updatedAt", "startedAt"];
+        for (let i = 0; i < keys.length; i++) {
+          let v;
+          try { v = typeof ev.get === "function" ? ev.get(keys[i]) : ev[keys[i]]; } catch (e) { continue; }
+          if (typeof v === "number" && v > 1e12) return v;
+          if (typeof v === "string") {
+            const t = Date.parse(v);
+            if (!isNaN(t)) return t;
           }
-          return 0;
-        };
-        let t = pick(turn);
-        if (!t) { try { t = pick(turn && turn.data); } catch (e) { t = 0; } }
-        return t || 0;
+        }
+        return 0;
+      }
+
+      function turnTime(turn) {
+        if (!turn || typeof turn !== "object") return 0;
+        const end = typeof turn.end === "object" ? turn.end : null;
+        const start = typeof turn.start === "object" ? turn.start : null;
+        return eventTime(end) || eventTime(start) || eventTime(turn) || 0;
+      }
+
+      // 回合身份：sessionId + 结束事件序号，重渲染时 textLen 会变但 seq 不变。
+      // props.seq 是 turnTail 插槽的 closing seq；没有就退到 end/start 的 seq。
+      function turnIdentity(turn, sessionId, seq) {
+        let n = Number(seq);
+        if (!(n > 0)) {
+          const ev = (turn && typeof turn.end === "object" && turn.end)
+            || (turn && typeof turn.start === "object" && turn.start);
+          n = ev ? Number(ev.seq) : 0;
+        }
+        const index = turn && typeof turn.turn === "number" ? turn.turn : "?";
+        return String(sessionId || "default") + ":" + (n > 0 ? n : "t" + index);
       }
 
       function trimForSpeech(text, max) {
@@ -192,43 +355,175 @@ window.__ModuleLoader__.load({
         return p > max * 0.6 ? cut.slice(0, p + 1) : cut;
       }
 
-      async function speakTurn(turn, sessionId) {
+      function spokenStore(sessionId) {
+        const key = "voxrelay.spoken." + (sessionId || "default");
+        let arr = [];
+        try { arr = JSON.parse(sessionStorage.getItem(key) || "[]"); } catch (e) { arr = []; }
+        return { key: key, arr: Array.isArray(arr) ? arr : [] };
+      }
+
+      function saveSpoken(store) {
+        if (store.arr.length > 80) store.arr = store.arr.slice(-80);
+        try { sessionStorage.setItem(store.key, JSON.stringify(store.arr)); } catch (e) { /* 忽略 */ }
+      }
+
+      function seenSeqOf(sessionId) {
+        const sid = String(sessionId || "default");
+        if (seenSeq.has(sid)) return seenSeq.get(sid);
+        const store = spokenStore(sid);
+        // 老数据只有文本 hash，没有 seq；从 identity 里取一次，避免重启后重念。
+        let max = 0;
+        store.arr.forEach(function (x) {
+          // t2: 是修正正文提取后的命名空间；旧 t: 标记对应思考文本，必须忽略。
+          const m = /^t2:(\d+)\|/.exec(String(x));
+          if (m) max = Math.max(max, Number(m[1]) || 0);
+        });
+        seenSeq.set(sid, max);
+        return max;
+      }
+
+      function markSeenSeq(sessionId, seq) {
+        const sid = String(sessionId || "default");
+        const n = Number(seq);
+        if (!(n > 0) || n <= seenSeqOf(sid)) return;
+        seenSeq.set(sid, n);
+      }
+
+      async function speakTurn(turn, sessionId, identity, seq) {
+        // 新的回合一来就撤销上一回合：正在下载的不再播，正在播的立刻停。
+        const my = ++ticket;
+        gen = my;
+        if (activeController) {
+          try { activeController.abort(); } catch (e) { /* 忽略 */ }
+        }
+        activeController = null;
+        try { if (currentAudio) currentAudio.pause(); } catch (e) { /* 忽略 */ }
         try {
-          const m = await call("/v1/mode");
-          if (!m || !m.enabled) return;
-          const text = trimForSpeech(extractReply(turn), 300);
-          if (!text) return;
+          if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+        } catch (e) { /* 忽略 */ }
+        currentAudio = null;
+        currentAudioUrl = null;
+        if (my !== gen) return; // 保险：理论上不会在同步段被抢
 
+        let ctrl = null;
+        if (typeof AbortController === "function") ctrl = new AbortController();
+        activeController = ctrl;
+
+        try {
+          let m;
+          try {
+            m = await call("/v1/mode");
+          } catch (first) {
+            // DSH 刚起来 / 服务刚重启时，BASE 可能还指着旧端口。
+            // 直接放弃会让整批回复都没声音——先向宿主问一次真实地址再重试一次。
+            const found = await discoverBase();
+            if (!found || found === BASE) throw first;
+            BASE = found;
+            try { localStorage.setItem(BASE_KEY, found); } catch (e) { /* 忽略 */ }
+            report({ stage: "rebased", base: found });
+            m = await call("/v1/mode");
+          }
+          if (my !== gen) return;
+          if (!m || !m.enabled) {
+            report({ stage: "mode", enabled: !!(m && m.enabled) });
+            return;
+          }
+          let info = extractReplyInfo(turn);
+          let text = trimForSpeech(info.text, 300);
+          report({ stage: "source", src: info.source, kinds: info.kinds, len: text.length });
+          if (!text) {
+            // 结构变了、正文挖不出来：再松一次，别让整段回复静音
+            const loose = extractReplyLoose(turn);
+            if (loose) {
+              info = { source: "loose", kinds: "" };
+              text = trimForSpeech(loose, 300);
+              report({ stage: "extract-loose", len: text.length });
+            }
+          }
+          if (!text) {
+            report({ stage: "extract", len: 0 });
+            return;
+          }
+
+          // 按回合身份去重：同一回合的 textLen 会从 0→短→长反复变，
+          // 文本 hash 每次都不同，挡不住重挂载；seq 才是稳定身份。
           const h = hashText(text);
-          const key = "voxrelay.spoken." + (sessionId || "default");
-          let arr = [];
-          try { arr = JSON.parse(sessionStorage.getItem(key) || "[]"); } catch (e) { arr = []; }
-          if (arr.indexOf(h) >= 0) return;
-          arr.push(h);
-          if (arr.length > 60) arr = arr.slice(-60);
-          try { sessionStorage.setItem(key, JSON.stringify(arr)); } catch (e) { /* 忽略 */ }
+          const token = "t2:" + (seq || 0) + "|" + identity;
+          const store = spokenStore(sessionId);
+          if (firedKeys.has(token) || firedKeys.has(h) || store.arr.indexOf(token) >= 0 || store.arr.indexOf(h) >= 0) {
+            report({ stage: "dup", len: text.length, by: "turn" });
+            return;
+          }
+          // 先写去重标记再发请求：并发挂载时后来的直接退出，不会重复合成。
+          firedKeys.add(token);
+          firedKeys.add(h);
+          store.arr.push(token, h);
+          saveSpoken(store);
+          markSeenSeq(sessionId, seq);
 
-          const res = await fetch(BASE + "/v1/audio/speech", {
+          const opt = {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-VoiceHub-Auto": "1" },
             body: JSON.stringify({ input: text, voice: m.voice }),
-          });
-          if (!res.ok) return;
+          };
+          if (ctrl) opt.signal = ctrl.signal;
+          const res = await fetch(BASE + "/v1/audio/speech", opt);
+          if (my !== gen) return;
+          if (!res.ok) {
+            report({ stage: "fetch", status: res.status });
+            return;
+          }
           const blob = await res.blob();
-          if (!blob || blob.size < 500) return;
+          if (my !== gen) return;
+          if (!blob || blob.size < 500) {
+            report({ stage: "blob", size: blob ? blob.size : 0 });
+            return;
+          }
 
-          try { if (currentAudio) currentAudio.pause(); } catch (e) { /* 忽略 */ }
           const url = URL.createObjectURL(blob);
           const audio = new Audio(url);
           currentAudio = audio;
+          currentAudioUrl = url;
           audio.onended = function () {
-            URL.revokeObjectURL(url);
+            try { URL.revokeObjectURL(url); } catch (e) { /* 忽略 */ }
+            if (currentAudioUrl === url) currentAudioUrl = null;
             if (currentAudio === audio) currentAudio = null;
           };
-          audio.play().catch(function () { /* 浏览器拦截自动播放时静默 */ });
+          report({ stage: "blob", size: blob.size });
+          audio.play().then(function () {
+            if (my === gen) report({ stage: "play", ok: true });
+          }).catch(function (e) {
+            report({ stage: "play", ok: false, err: String(e).slice(0, 80) });
+          });
         } catch (e) {
-          /* 朗读失败不影响聊天 */
+          if (e && e.name === "AbortError") {
+            report({ stage: "abort" });
+            return;
+          }
+          report({ stage: "error", err: String(e).slice(0, 120) });
         }
+      }
+
+      // DSH 重放历史会话时，同一 tick 会mount十几个回合组件。
+      // 攒 700ms 成一批：只有批次里 seq 最大（最新结束）的那个允许朗读。
+      function flushBatch() {
+        batchTimer = null;
+        const batch = pendingTurns;
+        pendingTurns = [];
+        if (!batch.length) return;
+        let pick = null;
+        batch.forEach(function (item) {
+          if (!pick) { pick = item; return; }
+          // seq 优先；老版本 DSH 没有 seq 时用结束时间兜底，别总选中第一批里最旧的那个。
+          if (item.seq > pick.seq
+            || (item.seq === pick.seq && item.when > pick.when)
+            || (item.seq === pick.seq && item.when === pick.when && item.textLen > pick.textLen)) pick = item;
+        });
+        if (!pick) return;
+        report({ stage: "batch", size: batch.length, seq: pick.seq || 0, len: pick.textLen });
+        // seq 为 0 的老版本 DSH：靠 identity + 文本 hash 去重，不在这里拦。
+        if (pick.seq > 0 && pick.seq <= seenSeqOf(pick.sessionId)) return;
+        speakTurn(pick.turn, pick.sessionId, pick.identity, pick.seq);
       }
 
       // 挂在每个回合的尾部：回合结束才渲染，正好是「说完再念」的时机。
@@ -237,14 +532,73 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (fired.current) return;
           fired.current = true;
-          // 有回合时间戳就以它为准：一分钟前的旧回合是历史重放，不念。
-          // 拿不到时间才退回「页面刚加载 3 秒内算历史」。
-          const when = turnTime(props.turn);
-          if (when ? Date.now() - when > 60000 : Date.now() - BOOT_AT < 3000) return;
-          const t = setTimeout(function () {
-            speakTurn(props.turn, props.sessionId);
-          }, 700);
-          return function () { clearTimeout(t); };
+          // 朗读来源不是「面板」时，回合尾部不再自动念，交给 agent 用 speak。
+          // speechMode 由面板轮询更新；刚启动还没轮询到就用默认 panel，不额外阻塞。
+          if (speechMode !== "panel") {
+            report({ stage: "skip", reason: "speech_mode=" + speechMode });
+            return;
+          }
+          const turn = props.turn;
+          const when = turnTime(turn);
+          // 证明不了是刚结束的新回合就不念：宁可偶尔静音，也别重念整段历史。
+          const old = when ? Date.now() - when > 60000 : true;
+          const seq = Number(props.seq) || 0;
+          const identity = turnIdentity(turn, props.sessionId, seq);
+          // DSH 的 seq 是 closing seq，和 end.seq 同源；优先 props，其次 end。
+          const orderSeq = seq || Number(turn && turn.end && turn.end.seq) || 0;
+          let keys = [];
+          try {
+            keys = turn && typeof turn === "object" ? Object.keys(turn).slice(0, 20) : [];
+          } catch (e) { keys = []; }
+          // 正文取不到时得知道 turn.data 长什么样，否则没法判断该往哪一层挖
+          let dataKeys = "";
+          try {
+            const d = turn && turn.data;
+            if (d && typeof d === "object") {
+              const ks = typeof d.keys === "function" ? Array.from(d.keys()) : Object.keys(d);
+              dataKeys = ks.slice(0, 10).join(",");
+            } else {
+              dataKeys = "typeof:" + typeof d;
+            }
+          } catch (e) {
+            dataKeys = "?";
+          }
+          let probe = {};
+          try {
+            probe = {
+              startType: typeof (turn && turn.start),
+              startTime: (turn && turn.start && turn.start.time) || 0,
+              startSeq: (turn && turn.start && turn.start.seq) || 0,
+              endType: typeof (turn && turn.end),
+              endTime: (turn && turn.end && turn.end.time) || 0,
+              endSeq: (turn && turn.end && turn.end.seq) || 0,
+              status: (turn && turn.status) || "",
+            };
+          } catch (e) { probe = { probeErr: String(e).slice(0, 40) }; }
+          const info = extractReplyInfo(turn);
+          report(Object.assign({
+            stage: "mount",
+            sid: String(props.sessionId || "").slice(-8),
+            keys: keys,
+            dataKeys: dataKeys,
+            textLen: info.text.length,
+            src: info.source,
+            kinds: info.kinds,
+            old: old,
+            when: when || 0,
+            seq: seq,
+          }, probe));
+          if (old) return;
+          pendingTurns.push({
+            turn: turn,
+            sessionId: props.sessionId,
+            seq: orderSeq,
+            identity: identity,
+            when: when,
+            textLen: info.text.length,
+          });
+          if (batchTimer) return;
+          batchTimer = setTimeout(flushBatch, 700);
         }, []);
         return null;
       }
@@ -254,6 +608,8 @@ window.__ModuleLoader__.load({
         const [voices, setVoices] = React.useState([]);
         const [err, setErr] = React.useState("");
         const [busy, setBusy] = React.useState(false);
+        // 「关闭全部服务」要点两下：第一下变成确认态，4 秒不点自动复原，防误触
+        const [confirmStop, setConfirmStop] = React.useState(false);
         const [showLoc, setShowLoc] = React.useState(false);
         const [locGsv, setLocGsv] = React.useState("");
         const [locRvc, setLocRvc] = React.useState("");
@@ -262,12 +618,29 @@ window.__ModuleLoader__.load({
         const locInit = React.useRef(false);
         // 用户手填过地址就锁住，别再被自动探测覆盖；点「自动检测」会解锁
         const baseLocked = React.useRef(false);
+        // 宿主侧的实时状态（三件套 + 语音模式）。8787 连不上时，面板靠它渲染，
+        // 也靠它把服务拉起来——这是「面板能自救」的关键。
+        const [host, setHost] = React.useState(null);
+
+        const refreshHost = React.useCallback(async () => {
+          try {
+            const d = await hostCall("/voicehub/status");
+            setHost(d && d.ok ? d : null);
+            return d;
+          } catch (e) {
+            setHost(null);
+            return null;
+          }
+        }, []);
 
         const load = React.useCallback(async () => {
           try {
             const [m, v] = await Promise.all([call("/v1/mode"), call("/v1/audio/voices")]);
             setMode(m);
             setVoices(v.voices || []);
+            if (m && (m.speech_mode === "panel" || m.speech_mode === "mcp")) {
+              speechMode = m.speech_mode;
+            }
             setErr("");
             if (!locInit.current && m && m.locations) {
               setLocGsv(m.locations.gsv || "");
@@ -276,27 +649,36 @@ window.__ModuleLoader__.load({
             }
           } catch (ex) {
             setErr("连不上服务（" + BASE + "）：" + ex.message);
-            // 连不上就问一次宿主：用户可能刚把端口改了、服务重启了。
-            // 下一轮轮询就会用上新地址，不用重启 DSH。
+            // 连不上就问宿主：它读 endpoint.json，端口被改过也能跟上。
+            const hd = await refreshHost();
             if (!baseLocked.current) {
-              const found = await discoverBase();
+              const found = (hd && hd.base) || (await discoverBase());
               if (found && found !== BASE) {
                 BASE = found;
                 setBaseInput(found);
                 setErr("");
+                // 持久化新地址，下次启动直接用对的
+                try { localStorage.setItem(BASE_KEY, found); } catch (e) { /* 忽略 */ }
               }
             }
           }
-        }, []);
+        }, [refreshHost]);
 
         React.useEffect(() => {
           let cancelled = false;
           const boot = async () => {
-            // 用户手动填过地址就听他的；没填过就问宿主真实端口
+            // 端口可能被改过，保存的地址只当「先试一下」的候选，不长期锁死：
+            // 连不上时 load() 的 catch 会向宿主重新问实际端口。
             let saved = null;
             try { saved = localStorage.getItem(BASE_KEY); } catch (e) { /* 忽略 */ }
             if (saved) {
-              baseLocked.current = true;
+              BASE = saved;
+              setBaseInput(saved);
+              // 以前手填过「别的机器」的地址：尊重它，别让自动探测冲掉。
+              // 手填的本机地址不锁——端口变了本来就该跟着走。
+              let manual = false;
+              try { manual = localStorage.getItem(BASE_MANUAL_KEY) === "1"; } catch (e) { /* 忽略 */ }
+              if (manual && !isLocalBase(saved)) baseLocked.current = true;
             } else {
               const found = await discoverBase();
               if (!cancelled && found && found !== BASE) {
@@ -316,6 +698,7 @@ window.__ModuleLoader__.load({
           BASE = v || DEFAULT_BASE;
           baseLocked.current = true;
           try { localStorage.setItem(BASE_KEY, BASE); } catch (e) { /* 忽略 */ }
+          try { localStorage.setItem(BASE_MANUAL_KEY, "1"); } catch (e) { /* 忽略 */ }
           setBaseInput(BASE);
           setErr("");
           load();
@@ -327,8 +710,10 @@ window.__ModuleLoader__.load({
             const m = await call("/v1/mode", body);
             setMode(m);
             setErr("");
+            return true;
           } catch (ex) {
             setErr(ex.message);
+            return false;
           } finally {
             setBusy(false);
           }
@@ -376,6 +761,23 @@ window.__ModuleLoader__.load({
           setErr("服务重启中，稍后自动重连…");
         };
 
+        // 整体关闭：必须走宿主。
+        // 8787 的 /v1/mode 只改开关、不碰进程；真正杀进程的是 mcp_server.set_voice_mode
+        // 里的 stop_services，所以这里转一手宿主。
+        // 用途：DSH 关掉后服务是 DETACHED 的、还在吃显存，靠这个按钮在关 DSH 前清干净。
+        const stopAll = async () => {
+          setBusy(true);
+          try {
+            await hostCall("/voicehub/mode", { enabled: false });
+            setErr("已发起关闭：三个进程会在几秒内退出，显存随之释放。");
+            setTimeout(refreshHost, 2500);
+          } catch (ex) {
+            setErr("关闭失败：" + ex.message);
+          } finally {
+            setBusy(false);
+          }
+        };
+
         const svcAction = async (name, action) => {
           setBusy(true);
           try {
@@ -383,20 +785,131 @@ window.__ModuleLoader__.load({
             setErr("");
             await load();
           } catch (ex) {
-            setErr(ex.message);
+            // 8787 没响应（比如刚把 VoiceHub 自己停了）：转宿主，
+            // 底下仍走 voice_services，路径不同、逻辑同一套。
+            try {
+              await hostCall("/voicehub/service", { name: name, action: action });
+              setErr(name + " " + action + " 已发起，稍后自动刷新…");
+              setTimeout(refreshHost, 2500);
+            } catch (e2) {
+              setErr(ex.message);
+            }
           } finally {
             setBusy(false);
           }
         };
 
         if (!mode) {
-          // 连不上的时候不能只丢一行错误：用户很可能是改过 config.json 的 port。
-          // 这里给一个地址框，填一次存进 localStorage，下次自动用。
-          return h("div", { style: { padding: 32, fontSize: 13, color: C.dim } },
-            h("div", null, err || "正在连接 VoiceHub…"),
-            err ? h("div", { style: { marginTop: 16 } },
+          // 连不上 8787 不等于没救：宿主路由还活着，能看三件套状态、能直接把服务拉起来。
+          // 地址框保留——端口被改过时手填一次仍然最快。
+          const hs = (host && host.services) || null;
+          const enabled = host && host.mode ? !!host.mode.enabled : false;
+          const rows = [
+            ["VoiceHub", hs && hs.VoiceHub],
+            ["GSV", hs && hs.GSV],
+            ["RVC", hs && hs.RVC],
+          ];
+          const bootAll = async () => {
+            setBusy(true);
+            try {
+              await hostCall("/voicehub/mode", { enabled: true });
+              setErr("正在拉起语音服务（首次约 1 分钟，GSV 要加载模型）…");
+              setTimeout(refreshHost, 2500);
+            } catch (ex) {
+              setErr("拉起失败：" + ex.message);
+            } finally {
+              setBusy(false);
+            }
+          };
+          const startOne = async (name) => {
+            setBusy(true);
+            try {
+              await hostCall("/voicehub/service", { name: name, action: "start" });
+              setErr(name + " 已发起启动，状态稍后刷新…");
+              setTimeout(refreshHost, 2500);
+            } catch (ex) {
+              setErr(ex.message);
+            } finally {
+              setBusy(false);
+            }
+          };
+
+          return h("div", { style: { padding: "28px 32px", fontSize: 13, color: C.dim, maxWidth: 640 } },
+            h("div", { style: { fontSize: 15, fontWeight: 500, color: C.text, marginBottom: 6 } },
+              "语音服务未运行"),
+            h("div", { style: { lineHeight: 1.6, marginBottom: 18 } },
+              err || "服务没起，面板连不上 8787。"),
+
+            hs ? h("div", { style: { marginBottom: 20 } },
+              h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 8 } }, "组件状态"),
+              rows.map((pair) => {
+                const nm = pair[0];
+                const s = pair[1];
+                const installed = s ? s.installed !== false : null;
+                const running = s ? !!s.running : false;
+                return h("div", {
+                  key: nm,
+                  style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 },
+                },
+                  h("span", { style: { width: 76, color: C.text, fontSize: 13 } }, nm),
+                  h("span", {
+                    style: { fontSize: 12, color: running ? "#1a9e5c" : (!installed ? "#c0392b" : "#b7791f") },
+                  }, !s ? "未知" : (running ? "运行中" : (installed ? "未运行" : "未安装"))),
+                  running || installed === false ? null : h("button", {
+                    onClick: () => startOne(nm),
+                    disabled: busy,
+                    style: {
+                      marginLeft: 4, padding: "3px 12px", fontSize: 11, borderRadius: 6,
+                      cursor: busy ? "default" : "pointer",
+                      border: "1px solid " + C.line, background: C.bg, color: C.text,
+                    },
+                  }, "启动"),
+                );
+              }),
+            ) : null,
+
+            h("div", { style: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" } },
+              h("button", {
+                onClick: bootAll,
+                disabled: busy,
+                style: {
+                  padding: "8px 18px", fontSize: 13, border: 0, borderRadius: 8,
+                  background: C.accent, color: "#fff",
+                  cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1,
+                },
+              }, enabled ? "重新拉起全套" : "启动语音（全套）"),
+              // 可能只是 VoiceHub 自己掉了、GSV/RVC 还在吃显存，这里给个清干净的口子
+              h("button", {
+                onClick: () => {
+                  if (!confirmStop) {
+                    setConfirmStop(true);
+                    setTimeout(() => setConfirmStop(false), 4000);
+                    return;
+                  }
+                  setConfirmStop(false);
+                  stopAll();
+                },
+                disabled: busy,
+                style: {
+                  padding: "8px 18px", fontSize: 13, borderRadius: 8,
+                  cursor: busy ? "default" : "pointer",
+                  border: "1px solid " + (confirmStop ? "#c0392b" : C.line),
+                  background: confirmStop ? "#fcebeb" : C.bg,
+                  color: confirmStop ? "#c0392b" : C.text,
+                },
+              }, confirmStop ? "确认停止？" : "全部停止"),
+              h("button", {
+                onClick: () => setShowBase(!showBase),
+                style: {
+                  padding: 0, fontSize: 12, border: 0, background: "transparent",
+                  color: C.dim, cursor: "pointer", textDecoration: "underline",
+                },
+              }, showBase ? "收起地址" : "改服务地址"),
+            ),
+
+            showBase ? h("div", { style: { marginTop: 16 } },
               h("div", { style: { fontSize: 12, marginBottom: 6 } },
-                "服务地址（改过 config.json 的 port 就填在这里）"),
+                "服务地址（端口被改过就填这里，或点自动检测）"),
               h("div", { style: { display: "flex", gap: 8 } },
                 h("input", {
                   value: baseInput,
@@ -421,6 +934,7 @@ window.__ModuleLoader__.load({
               h("button", {
                 onClick: async () => {
                   try { localStorage.removeItem(BASE_KEY); } catch (e) { /* 忽略 */ }
+                  try { localStorage.removeItem(BASE_MANUAL_KEY); } catch (e) { /* 忽略 */ }
                   baseLocked.current = false;
                   const found = await discoverBase();
                   BASE = found || DEFAULT_BASE;
@@ -452,7 +966,21 @@ window.__ModuleLoader__.load({
 
           h(Field, { label: "语音模式" },
             h("button", {
-              onClick: () => send({ enabled: !mode.enabled }),
+              onClick: async () => {
+                const next = !mode.enabled;
+                const ok = await send({ enabled: next });
+                if (!ok) {
+                  // 8787 连不上：总开关交给宿主，底下走 mcp_server.set_voice_mode，
+                  // 和「打开 mod1 / 关闭 mod1」是同一条路径。
+                  try {
+                    await hostCall("/voicehub/mode", { enabled: next });
+                    setErr(next ? "正在拉起语音服务（首次约 1 分钟）…" : "正在停止服务…");
+                    setTimeout(load, 3000);
+                  } catch (e2) {
+                    setErr(e2.message);
+                  }
+                }
+              },
               disabled: busy,
               style: {
                 padding: "8px 20px", fontSize: 13, borderRadius: 8, cursor: busy ? "default" : "pointer",
@@ -461,6 +989,71 @@ window.__ModuleLoader__.load({
                 color: mode.enabled ? "#fff" : C.text,
               },
             }, mode.enabled ? "已开启 · 点此关闭" : "已关闭 · 点此开启"),
+          ),
+
+          h(Field, { label: "朗读来源" },
+            h(Seg, {
+              items: [
+                { value: "panel", label: "面板朗读", active: speechMode === "panel",
+                  hint: "回合结束自动朗读，agent 不重复念" },
+                { value: "mcp", label: "MCP 朗读", active: speechMode === "mcp",
+                  hint: "由 AI 用 speak 工具朗读，面板不自动念" },
+              ],
+              onPick: async (value) => {
+                const prev = speechMode;
+                speechMode = value;   // 先本地生效，让下一个回合立刻按新来源走
+                setMode(Object.assign({}, mode, { speech_mode: value }));
+                const ok = await send({ speech_mode: value });
+                if (!ok) {
+                  // 8787 连不上：回滚本地状态，改走宿主
+                  speechMode = prev;
+                  setMode(Object.assign({}, mode, { speech_mode: prev }));
+                  try {
+                    await hostCall("/voicehub/mode", { speech_mode: value });
+                    setErr("已提交切换，稍后自动刷新…");
+                    setTimeout(load, 2000);
+                  } catch (e2) {
+                    setErr(e2.message);
+                  }
+                }
+              },
+            }),
+            h("div", { style: { marginTop: 12, display: "flex", gap: 14 } },
+              // 面板朗读：稳定、不漏，但不挑重点
+              h("div", {
+                style: {
+                  flex: 1, padding: "10px 12px", borderRadius: 8,
+                  border: "1px solid " + (speechMode === "panel" ? C.accent : C.line),
+                  background: speechMode === "panel" ? "rgba(31,111,235,0.06)" : C.bg,
+                },
+              },
+                h("div", { style: { fontSize: 12, fontWeight: 600, marginBottom: 4,
+                  color: speechMode === "panel" ? C.accent : C.text } }, "面板朗读"),
+                h("div", { style: { fontSize: 12, lineHeight: 1.6,
+                  color: speechMode === "panel" ? C.text : C.dim } },
+                  "优点：稳定、不依赖 AI 记性，每句都会念。"),
+                h("div", { style: { fontSize: 12, lineHeight: 1.6,
+                  color: speechMode === "panel" ? C.text : C.dim } },
+                  "缺点：长文本整段照念，不挑重点，略显啰嗦。"),
+              ),
+              // MCP 朗读：有取舍，更聪明，但依赖 AI 每次记得调
+              h("div", {
+                style: {
+                  flex: 1, padding: "10px 12px", borderRadius: 8,
+                  border: "1px solid " + (speechMode === "mcp" ? C.accent : C.line),
+                  background: speechMode === "mcp" ? "rgba(31,111,235,0.06)" : C.bg,
+                },
+              },
+                h("div", { style: { fontSize: 12, fontWeight: 600, marginBottom: 4,
+                  color: speechMode === "mcp" ? C.accent : C.text } }, "MCP 朗读"),
+                h("div", { style: { fontSize: 12, lineHeight: 1.6,
+                  color: speechMode === "mcp" ? C.text : C.dim } },
+                  "优点：更懂语境，长文本自动提炼核心，不念代码/表格/长数字。"),
+                h("div", { style: { fontSize: 12, lineHeight: 1.6,
+                  color: speechMode === "mcp" ? C.text : C.dim } },
+                  "缺点：依赖 AI 每轮主动调用，偶尔会漏念。"),
+              ),
+            ),
           ),
 
           h(Field, { label: "引擎" },
@@ -605,7 +1198,7 @@ window.__ModuleLoader__.load({
           ),
 
           h(Field, { label: "维护" },
-            h("div", { style: { display: "flex", gap: 8 } },
+            h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
               h("button", {
                 onClick: rescan,
                 disabled: busy,
@@ -621,7 +1214,29 @@ window.__ModuleLoader__.load({
                   border: "1px solid " + C.line, background: C.bg, color: C.text,
                 },
               }, "重启服务"),
+              h("button", {
+                onClick: () => {
+                  if (!confirmStop) {
+                    setConfirmStop(true);
+                    setTimeout(() => setConfirmStop(false), 4000);
+                    return;
+                  }
+                  setConfirmStop(false);
+                  stopAll();
+                },
+                disabled: busy,
+                style: {
+                  padding: "7px 16px", fontSize: 13, borderRadius: 8,
+                  cursor: busy ? "default" : "pointer",
+                  border: "1px solid " + (confirmStop ? "#c0392b" : C.line),
+                  background: confirmStop ? "#fcebeb" : C.bg,
+                  color: confirmStop ? "#c0392b" : C.text,
+                },
+              }, confirmStop ? "确认关闭全部？" : "关闭全部服务"),
             ),
+            h("div", { style: { fontSize: 12, color: C.dim, marginTop: 10, lineHeight: 1.6 } },
+              "「关闭全部服务」会停掉 VoiceHub / GSV / RVC 三个进程并关闭语音模式、释放显存。",
+              "DSH 关掉之后这些进程仍在后台跑，要清干净就点它。"),
           ),
 
           h("div", { style: { fontSize: 12, color: C.dim, borderTop: "1px solid " + C.line, paddingTop: 14 } },
@@ -719,6 +1334,18 @@ window.__ModuleLoader__.load({
 
       exports.apply = apply;
       exports.inject = ["slots"];
+      // 自检用：只暴露纯函数，不碰 fetch / storage / Audio。
+      exports.__test = {
+        eventTime: eventTime,
+        turnTime: turnTime,
+        turnIdentity: turnIdentity,
+        hashText: hashText,
+        trimForSpeech: trimForSpeech,
+        extractReply: extractReply,
+        extractReplyInfo: extractReplyInfo,
+        textFromBlocks: textFromBlocks,
+        walkSpeechStrings: walkSpeechStrings,
+      };
       return module.exports;
     } catch (err) {
       try { console.error("voicehub-panel: 注册失败", err); } catch { /* ignore */ }

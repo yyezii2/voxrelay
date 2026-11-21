@@ -106,11 +106,16 @@ INSTRUCTIONS_MCP = (
 
 
 def _instructions_for(params):
-    """有侧边栏面板的客户端（DSH）让面板自己念，别让模型再调一次。
+    """朗读来源（speech_mode）决定 agent 该不该主动念，读 voice_mode.json 现算。
 
-    其他客户端（WorkBuddy 等）没有面板，只能靠模型每轮调 speak。
-    判据是 MCP initialize 里的 clientInfo.name。
+    - panel：有面板的客户端让面板念，agent 别调 speak（否则双念）。
+    - mcp：没有面板 / 用户在面板里选了「MCP 朗读」，agent 每轮调 speak。
+    用户可在面板里随时切换，切完下一轮指令就跟着变。
     """
+    st = _load_state()
+    if (st.get("speech_mode") or "panel") == "mcp":
+        return INSTRUCTIONS_MCP
+    # 兜底：语音来源不是 mcp 时，再按客户端名判断——有面板就别让模型念。
     info = (params or {}).get("clientInfo") or {}
     name = str(info.get("name") or "").lower()
     if any(k in name for k in ("dsh", "deepseek", "harness")):
@@ -180,8 +185,23 @@ TOOLS = [
     },
     {
         "name": "get_voice_mode",
-        "description": "查看语音模式当前是开还是关、用的哪个音色。",
+        "description": "查看语音模式当前是开还是关、用的哪个音色、朗读来源是谁。",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_speech_mode",
+        "description": (
+            "切换「谁负责朗读」：panel=面板自动朗读（回合结束自动念，agent 别调 speak）；"
+            "mcp=agent 用 speak 工具朗读（面板关闭自动朗读）。"
+            "用户说「让面板念 / 让 MCP 念 / 换成面板朗读 / 换成 MCP 朗读」时用本工具。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "description": "panel 或 mcp"},
+            },
+            "required": ["mode"],
+        },
     },
     {
         "name": "list_voices",
@@ -201,6 +221,9 @@ def _load_state():
     s.setdefault("voice", DEFAULT_VOICE)
     s.setdefault("volume", 0.7)
     s.setdefault("modes", {})
+    # 朗读来源：panel=面板自动朗读，mcp=agent 用 speak 工具念。
+    # 与 server.py 的 voice_mode.json 是同一份，谁先改都行。
+    s.setdefault("speech_mode", "panel")
     return s
 
 
@@ -292,6 +315,10 @@ def speak(text, voice=None):
     st = _load_state()
     if not st["enabled"]:
         return "语音模式已关闭，这段话没有朗读。需要开就说“打开语音”。"
+    # 朗读来源是「面板」时，agent 不该再主动念——面板会在回合结束自动朗读，
+    # 这里静默返回，避免同一段被念两遍。用户在面板里切到「MCP 朗读」后这里才真正出声。
+    if (st.get("speech_mode") or "panel") == "panel":
+        return "朗读由面板负责，本工具静默跳过（面板里可切到 MCP 朗读）。"
 
     want = voice or st["voice"]
     vid = _resolve_voice(want)
@@ -568,6 +595,17 @@ def _voice_label(vid):
     return (voices.get(vid) or {}).get("name") or vid
 
 
+def set_speech_mode(mode):
+    """切换朗读来源。panel / mcp 二选一，非法值原样报错。"""
+    if mode not in ("panel", "mcp"):
+        return "speech_mode 只能是 panel 或 mcp，收到：%s" % mode
+    st = _load_state()
+    st["speech_mode"] = mode
+    _save_state(st)
+    who = "面板自动朗读（回合结束自动念，agent 不再主动念）" if mode == "panel" else "MCP 朗读（agent 每轮调 speak）"
+    return "朗读来源已切换为：%s" % who
+
+
 def set_voice_mode(enabled=None, voice=None, mode=None, stop_services_flag=True,
                    volume=None):
     st = _load_state()
@@ -630,9 +668,10 @@ def set_voice_mode(enabled=None, voice=None, mode=None, stop_services_flag=True,
 
 def get_voice_mode():
     st = _load_state()
-    return "语音模式：%s，音色：%s（%s），音量：%.2f%s" % (
+    who = "面板自动朗读" if (st.get("speech_mode") or "panel") == "panel" else "MCP 朗读"
+    return "语音模式：%s，音色：%s（%s），音量：%.2f%s，朗读来源：%s" % (
         "开启" if st["enabled"] else "关闭", _voice_label(st["voice"]), st["voice"],
-        _read_volume(), "，模式 %s" % st["mode"] if st.get("mode") else "")
+        _read_volume(), "，模式 %s" % st["mode"] if st.get("mode") else "", who)
 
 
 def list_voices():
@@ -654,6 +693,8 @@ def call_tool(name, args):
                               args.get("stop_services", True), args.get("volume")), False
     if name == "get_voice_mode":
         return get_voice_mode(), False
+    if name == "set_speech_mode":
+        return set_speech_mode(args.get("mode")), False
     if name == "list_voices":
         return list_voices(), False
     return "未知工具：%s" % name, True
@@ -669,7 +710,7 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "voicehub", "version": "0.1.0"},
+            "serverInfo": {"name": "voxrelay", "version": "0.2.0"},
             # 规则随握手下发：有面板的客户端让面板念，没有的让模型调 speak
             "instructions": _instructions_for(params),
         }}

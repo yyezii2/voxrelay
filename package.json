@@ -1,6 +1,6 @@
 {
   "name": "voxrelay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "本地语音服务（OpenAI 兼容）+ DSH 侧边栏面板 + MCP 工具，一个包。Python 管服务，package.json 管 DSH 插件。",

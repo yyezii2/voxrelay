@@ -188,6 +188,9 @@ def _upstream_synth(text, speed, path_stem):
 
 
 _GSV_SET = {"gpt": None, "sovits": None}
+# 并发合成时多个线程会同时走到下面：检查时都是空，于是同一权重被切换 N 次。
+# 检查 + HTTP 切换 + 写缓存必须是一段临界区，后来的请求等锁并直接复用结果。
+_GSV_WEIGHT_LOCK = threading.Lock()
 
 
 def _gsv_base():
@@ -205,16 +208,19 @@ def _gsv_get(base, path, timeout=120):
 
 
 def _gsv_set_weights(kind, path):
-    """切换到指定的训练权重；同一条路径只切一次。"""
-    if not path or _GSV_SET[kind] == path:
+    """切换到指定的训练权重；同一条路径只切一次（并发请求也只切一次）。"""
+    if not path:
         return
-    from urllib.parse import quote
+    with _GSV_WEIGHT_LOCK:
+        if _GSV_SET[kind] == path:
+            return
+        from urllib.parse import quote
 
-    cfg, base = _gsv_base()
-    endpoint = "/set_gpt_weights" if kind == "gpt" else "/set_sovits_weights"
-    _gsv_get(base, "%s?weights_path=%s" % (endpoint, quote(path)))
-    _GSV_SET[kind] = path
-    _log("[gsv] 已切换 %s 权重 -> %s" % (kind, os.path.basename(path)))
+        cfg, base = _gsv_base()
+        endpoint = "/set_gpt_weights" if kind == "gpt" else "/set_sovits_weights"
+        _gsv_get(base, "%s?weights_path=%s" % (endpoint, quote(path)))
+        _GSV_SET[kind] = path
+        _log("[gsv] 已切换 %s 权重 -> %s" % (kind, os.path.basename(path)))
 
 
 def _gsv_synth(text, entry, speed, path_stem):

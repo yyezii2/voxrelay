@@ -42,7 +42,7 @@ import voice_services as VS  # noqa: E402
 LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "server.log")
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 START_TS = time.time()
 
 # 实际监听的地址，main() 里填。重启时要用它拉新进程，
@@ -144,6 +144,9 @@ def _read_state():
     s.setdefault("modes", {})
     s.setdefault("engine", _voice_engine(s["voice"]))
     s.setdefault("speed", 1.0)
+    # 朗读来源：panel=面板自动朗读（turnTail 插槽），mcp=agent 用 speak 工具念。
+    # 两边改的是同一份状态，谁先改都行，另一边下次读到就是新值。
+    s.setdefault("speech_mode", "panel")
     return s
 
 
@@ -257,6 +260,30 @@ def _rescan():
     }
 
 
+def _panel_debug(body):
+    """面板前端把「朗读组件走到哪一步」上报到这里，排查用。
+
+    只收键名、长度、状态码这类结构化信息，不收集聊天正文。
+    """
+    try:
+        line = json.dumps(body, ensure_ascii=False)[:2000]
+        path = os.path.join(BASE_DIR, "logs", "panel-debug.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s\t%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            if len(lines) > 200:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.writelines(lines[-200:])
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 def _task_name():
     """本机若用计划任务托管这几个服务，重启时优先让它来拉。"""
     return os.environ.get("VOXRELAY_TASK") or os.environ.get("VOICEHUB_TASK") or "VoiceHub-Services"
@@ -332,6 +359,7 @@ def _mode_payload():
         "engine": s.get("engine"),
         "engine_voices": s.get("engineVoices") or {},
         "mode": s.get("mode"),
+        "speech_mode": s.get("speech_mode") or "panel",
         "volume": _current_volume(),
         "speed": s.get("speed") or 1.0,
         "stack": _stack_status(),
@@ -365,6 +393,8 @@ def _apply_mode(body):
             s["speed"] = max(0.5, min(2.0, float(body["speed"])))
         except (TypeError, ValueError):
             raise ValueError("speed 必须是数字")
+    if body.get("speech_mode") in ("panel", "mcp"):
+        s["speech_mode"] = body["speech_mode"]
     vid = body.get("voice")
     if vid:
         if vid not in voices:
@@ -448,7 +478,11 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Requested-With")
+        # X-VoiceHub-Auto 必须放行：面板是浏览器，发合成请求时带这个自定义头，
+        # preflight 没允许它整条请求就会被浏览器拦掉，表现为 TypeError: Failed to fetch，
+        # 服务端连日志都收不到。
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type,Authorization,X-Requested-With,X-VoiceHub-Auto")
         self.send_header("Access-Control-Expose-Headers", "X-VoxRelay-Engine,X-VoxRelay-Note,X-VoxRelay-RVC,X-VoxRelay-Cache")
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
@@ -558,6 +592,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, _restart())
             if path in ("/v1/service", "/service"):
                 return self._json(200, _apply_service(self._body_json()))
+            if path in ("/v1/debug", "/debug"):
+                return self._json(200, _panel_debug(self._body_json()))
             return self._err(404, "未知路径: %s" % path)
         except ValueError as exc:
             return self._err(400, str(exc))
