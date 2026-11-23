@@ -8,9 +8,10 @@ POST http://127.0.0.1:8787/v1/audio/speech
 {"input": "要念的话", "voice": "xiaoxiao", "speed": 1.0}
 ```
 
-- 五个 Python 文件，标准库实现，没有 Web 框架；MCP 和侧边栏面板都是可选的
+- 纯标准库实现，没有 Web 框架；MCP 和侧边栏面板都是可选的
 - 一个仓库就是一个包：`package.json` 管 DSH 插件，`server.py` 管服务，共用同一份 `config.json`
-- 引擎可叠：edge-tts（免费在线）→ Windows SAPI（离线兜底）→ 上游服务 → RVC 后处理
+- 引擎可叠：edge-tts（免费在线）→ Windows SAPI（离线兜底）→ 上游服务 → RVC 后处理；
+  吃显存的 GSV / RVC / Higgs / CosyVoice 四选一互斥，同一时刻只跑一个
 - 任何一个引擎挂掉都会被降级绕过，**保证一定有声音出来**
 - 音色由你自己带，仓库不含任何模型（见 [models/README.md](models/README.md)）
 
@@ -53,6 +54,11 @@ python smoke.py
 | GET | `/health` | 引擎状态、音色数、运行时长 |
 | GET | `/v1/audio/voices` | 音色列表，含每个音色的 `ready` 状态 |
 | POST | `/v1/audio/speech` | OpenAI 兼容合成，返回音频流 |
+| POST | `/v1/long-tts` | 长文本合成（按句切段、逐段合成、拼成单个 WAV） |
+| GET | `/long` | 长文合成页面 |
+| GET | `/long-file?name=..` | 下载已合成的长文 WAV |
+| POST | `/v1/voice` | 添加克隆音色（higgs/cosy 零样本，写回 config.json） |
+| POST | `/v1/voice/delete` | 删除 `custom-` 前缀的音色 |
 | GET | `/say?text=..&voice=..` | 浏览器直接听 |
 | GET | `/` | 试听页 |
 
@@ -60,12 +66,13 @@ python smoke.py
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/mode` | 开关、音色、引擎、音量、语速、三件套端口 |
+| GET | `/v1/mode` | 开关、音色、音量、语速、当前引擎 + 四个引擎的端口 |
 | POST | `/v1/mode` | 改上面任意一项，字段按需给 |
 | GET | `/v1/stack` | 组件安装位置 + 运行状态 |
 | POST | `/v1/stack` | `{component:"gsv"\|"rvc", path:"..."}`，`path` 留空恢复默认 |
-| GET | `/v1/services` | 三个服务的 installed / running / port / reason |
+| GET | `/v1/services` | 五个服务的 installed / running / port / reason |
 | POST | `/v1/service` | `{name, action:"start"\|"stop"\|"restart"}` |
+| POST | `/v1/engine` | `{name:"GSV"\|"RVC"\|"Higgs"\|"CosyVoice"}`，四选一切换（阻塞，GSV 约 40s） |
 | POST | `/v1/rescan` | 重扫 `models/`，并把新发现的音色并进来 |
 | POST | `/v1/restart` | 重启本服务（保持原端口） |
 
@@ -156,6 +163,10 @@ agent。手动试听和明确调用不带这个头，照常出声。
 老版本 DSH 没有这个插槽时，注册失败会自动跳过，退化成「只靠 MCP 工具」——不会报错，
 也不会让面板消失。
 
+**侧边栏只有一个「语音」条目**，打开后面板顶部有「语音 / 长文合成」两个页签可切换。
+长文合成走服务端 `/v1/long-tts`：自动按句切段、逐段合成、拼成单个 WAV 下载，
+绕开 `/tts` 的 3000 字上限；段间停顿可调。
+
 安装（只是把包登记进 DSH，不会重装服务）：
 
 ```powershell
@@ -192,12 +203,20 @@ node_modules 链接 -> D:\你的路径\voxrelay
 
 | 路由 | 作用 |
 |---|---|
-| `GET /voicehub/status` | 三件套状态 + 语音模式，**不依赖 8787** |
-| `POST /voicehub/service` | `{name:"GSV"\|"VoiceHub"\|"RVC", action:"start"\|"stop"\|"restart"}` |
+| `GET /voicehub/status` | 服务状态 + 语音模式，**不依赖 8787** |
+| `POST /voicehub/service` | `{name:"GSV"\|"VoiceHub"\|"RVC"\|"Higgs"\|"CosyVoice", action:"start"\|"stop"\|"restart"}` |
 | `POST /voicehub/mode` | `{enabled:true\|false}`，总开关 |
 
-连不上 8787 时面板不会只剩一个"填地址"的空壳，而是显示「服务未运行」：列出三件套状态，
-给「启动语音（全套）」和每个组件的单独启动按钮。
+连不上 8787 时面板不会只剩一个"填地址"的空壳，而是显示「服务未运行」：列出各服务状态，
+给「启动语音面板」和每个组件的单独启动按钮。
+
+**引擎是四选一的**：GSV / RVC / Higgs / CosyVoice 都吃显存，同一时刻只允许一个在跑。
+面板上点「切到这里」会走 `voice_services.switch()`——先停掉其余三个、等端口释放，再启目标。
+对引擎点「启动」走的也是 `switch()`，不是简单的 `start()`，所以不会出现两个模型同时抢显存。
+
+因此「打开 mod1」也**只拉起一个引擎**：优先上次用的那个（`services.json` 里 `intent=on`），
+其余的在返回里标成「四选一：本次不启动」。已经有引擎在跑时一个都不起——不然一次请求就能把
+四个模型全装上，21GB 显存必炸。要换引擎请走面板或 `POST /v1/engine`。
 
 这些路由**不重写启停逻辑**——`start/stop` 转手调 `voice_services`，总开关转手调
 `mcp_server.set_voice_mode`，和「打开 mod1 / 关闭 mod1」、计划任务走的是同一套幂等逻辑、
@@ -206,7 +225,7 @@ node_modules 链接 -> D:\你的路径\voxrelay
 启停请求一律「立即返回、后台执行」：`start` 内部最长等 90 秒，同步等会把面板请求挂住，
 所以前端靠原有的 4 秒轮询看服务自己起来。
 
-**「关闭全部服务」**（面板底部「维护」区，要点两下确认）会停掉三个进程、关闭语音模式、释放显存。
+**「关闭全部服务」**（面板底部「维护」区，要点两下确认）会停掉所有引擎进程、关闭语音模式、释放显存。
 服务是 `DETACHED` 起的，DSH 关掉之后它们仍在后台跑 —— 要清干净就用这个按钮，不用去命令行。
 它走的是 `/voicehub/mode {enabled:false}` → `mcp_server.set_voice_mode` → `stop_services`，
 不自己实现停进程的逻辑。「服务未运行」页里也有一个「全部停止」，用来清掉 VoiceHub 掉了、
@@ -230,7 +249,8 @@ node client-selftest.mjs   # 前端：三个插槽是否都注册上（含回合
 server.py            HTTP 服务 + 试听页
 voice_engines.py     引擎层（edge / sapi / upstream / rvc）
 voice_models.py      models/ 自动发现
-voice_services.py    三个服务的启停、自愈、端口解析
+voice_services.py    五个服务 / 四个引擎的启停、自愈、端口解析
+service_lock.py      跨进程启停锁（面板 / MCP / HTTP 串行化，避免抢端口）
 mcp_server.py        MCP 封装
 smoke.py             冒烟测试（另起临时实例自检）
 index.js             面板宿主半边：/voicehub/endpoint，告诉前端服务在哪

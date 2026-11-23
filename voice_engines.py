@@ -7,12 +7,14 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VENDOR = os.path.join(ROOT, "vendor")
@@ -265,6 +267,104 @@ def _gsv_synth(text, entry, speed, path_stem):
     return path, ext
 
 
+def _cosy_synth(text, entry, speed, path_stem, instruct_override=None):
+    """调用 CosyVoice 3.0 本地服务（零样本克隆 / instruct 情感控制）。
+
+    instruct_override 传入时优先用它（长文合成页的语气指令覆盖音色默认值），
+    否则回落到音色条目 / engines.cosy 里的 instruct。
+    """
+    cfg = _CFG.get("engines", {}).get("cosy", {})
+    base = (cfg.get("base_url") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("engines.cosy.base_url 未配置")
+    ref = entry.get("ref_audio") or cfg.get("ref_audio") or ""
+    if not ref or not os.path.exists(ref):
+        raise RuntimeError("CosyVoice 参考音频不存在: %s" % ref)
+    mode = entry.get("cosy_mode") or cfg.get("cosy_mode") or "zero_shot"
+    instruct = instruct_override if instruct_override is not None \
+        else (entry.get("instruct") or cfg.get("instruct") or "")
+    payload = {
+        "text": text,
+        "mode": mode,
+        "prompt_text": entry.get("prompt_text") or cfg.get("prompt_text") or "",
+        "prompt_wav": ref,
+        "instruct": instruct,
+        "speed": float(speed or 1.0),
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        base + "/synthesize",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=int(cfg.get("timeout") or 600)) as resp:
+        resp_json = json.loads(resp.read().decode("utf-8"))
+    if resp_json.get("error"):
+        raise RuntimeError("CosyVoice 合成失败: %s" % resp_json["error"])
+    src = resp_json.get("path")
+    if not src or not os.path.exists(src):
+        raise RuntimeError("CosyVoice 未返回有效音频路径")
+    path = path_stem + ".wav"
+    with open(src, "rb") as fin, open(path, "wb") as fout:
+        fout.write(fin.read())
+    # worker 每次把音频落在 out/ 下的新临时文件；复制完就删，
+    # 否则每念一句都留一个几百 KB 孤儿，几天就堆出几个 GB。
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    return path, "wav"
+
+
+def _higgs_synth(text, entry, speed, path_stem):
+    """调用本地 Higgs worker（Qwen3-4B + higgs codec），零样本克隆。
+
+    实测结论：温度 0.5 / top_p 0.9 的重复一致性最好；长文本在 worker 侧按句切段，
+    段间 220ms 静音。speed 暂不支持（模型本身没有语速参数），需要变速请在调用方处理。
+    """
+    cfg = _CFG.get("engines", {}).get("higgs", {})
+    base = (cfg.get("base_url") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("engines.higgs.base_url 未配置")
+    ref = entry.get("ref_audio") or cfg.get("ref_audio") or ""
+    if not ref or not os.path.exists(ref):
+        raise RuntimeError("Higgs 参考音频不存在: %s" % ref)
+    payload = {
+        "text": text,
+        "prompt_wav": ref,
+        "prompt_text": entry.get("prompt_text") or cfg.get("prompt_text") or "",
+        "temperature": float(entry.get("temperature") or cfg.get("temperature") or 0.5),
+        "top_p": float(entry.get("top_p") or cfg.get("top_p") or 0.9),
+        "chunk": bool(entry.get("chunk", cfg.get("chunk", True))),
+        "max_chars": int(entry.get("max_chars") or cfg.get("max_chars") or 40),
+        "gap_ms": int(entry.get("gap_ms") or cfg.get("gap_ms") or 220),
+        "speed": float(entry.get("speed_factor") or cfg.get("speed_factor") or speed or 1.0),
+    }
+    req = urllib.request.Request(
+        base + "/synthesize",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=int(cfg.get("timeout") or 600)) as resp:
+        resp_json = json.loads(resp.read().decode("utf-8"))
+    if resp_json.get("error"):
+        raise RuntimeError("Higgs 合成失败: %s" % resp_json["error"])
+    src = resp_json.get("path")
+    if not src or not os.path.exists(src):
+        raise RuntimeError("Higgs 未返回有效音频路径")
+    path = path_stem + ".wav"
+    with open(src, "rb") as fin, open(path, "wb") as fout:
+        fout.write(fin.read())
+    # worker 落盘的临时文件复制完就删，否则每句留一个孤儿（同 _cosy_synth）
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    return path, "wav"
+
+
 def rvc_convert(src_path, model, pitch):
     cfg = _CFG.get("rvc", {})
     worker = (cfg.get("worker") or "").rstrip("/")
@@ -291,35 +391,55 @@ def rvc_convert(src_path, model, pitch):
 # ---------------------------------------------------------------- 对外接口
 
 
+def _port_up(url, timeout=0.15):
+    """按端口判断服务是否在跑。
+
+    以前这里用 urllib 打 GSV 的 /docs 和 RVC 的 /health，各自 2 秒超时：
+    服务没起的时候，/health 要等满 2~4 秒才返回，而它本身是探活接口，
+    慢到这个程度就失去了意义（冒烟测试用 2 秒超时轮询，永远等不到）。
+    端口在监听就说明进程活着，本地回环实测 <1ms。
+    """
+    try:
+        u = urlparse(url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        with socket.socket() as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, int(port))) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def engine_status():
+    """各引擎「当前可用吗」。
+
+    GPU 四引擎（gsv / rvc / higgs / cosy）用端口监听判断（零延迟、不卡），
+    否则每探一次要等一个 timeout。端口是否监听由 voice_services 统一维护，
+    和面板 / /v1/mode 的判断完全一致。
+    """
     rvc_cfg = _CFG.get("rvc", {})
-    rvc_on = bool(rvc_cfg.get("enabled"))
-    rvc_ok = False
-    if rvc_on:
-        try:
-            url = (rvc_cfg.get("worker") or "").rstrip("/") + "/health"
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                rvc_ok = resp.status == 200
-        except Exception:
-            rvc_ok = False
     up = _CFG.get("engines", {}).get("upstream", {})
-    gsv_cfg = _CFG.get("engines", {}).get("gsv", {})
-    gsv_ok = False
-    if gsv_cfg.get("base_url"):
-        try:
-            with urllib.request.urlopen(gsv_cfg["base_url"].rstrip("/") + "/docs", timeout=2) as resp:
-                gsv_ok = resp.status == 200
-        except urllib.error.HTTPError:
-            gsv_ok = True
-        except Exception:
-            gsv_ok = False
+
+    # 端口监听判断（不发起 HTTP，绝不超时）
+    try:
+        import voice_services as _VS
+        svc = _VS.status()
+        gsv_ok = bool(svc.get("GSV", {}).get("running"))
+        cosy_ok = bool(svc.get("CosyVoice", {}).get("running"))
+        higgs_ok = bool(svc.get("Higgs", {}).get("running"))
+        rvc_ok = bool(svc.get("RVC", {}).get("running"))
+    except Exception:  # noqa: BLE001
+        gsv_ok = cosy_ok = higgs_ok = rvc_ok = False
+
     return {
         "edge": has_edge(),
         "sapi": has_sapi(),
         "upstream": bool(up.get("enabled") and up.get("base_url")),
         "gsv": gsv_ok,
+        "higgs": higgs_ok,
+        "cosy": cosy_ok,
         "rvc": rvc_ok,
-        "rvc_enabled": rvc_on,
+        "rvc_enabled": bool(rvc_cfg.get("enabled")),
     }
 
 
@@ -337,6 +457,10 @@ def list_voices():
             ready = st["upstream"]
         elif eng == "gsv":
             ready = st["gsv"]
+        elif eng == "higgs":
+            ready = st["higgs"]
+        elif eng == "cosy":
+            ready = st["cosy"]
         out.append(
             {
                 "id": vid,
@@ -346,13 +470,30 @@ def list_voices():
                 "language": v.get("language") or "zh-CN",
                 "rvc": v.get("rvc") or None,
                 "ready": ready,
+                # 语气参考：参考音台词 + 语气指令，面板「语气提示词」用它做展示
+                "prompt_text": v.get("prompt_text") or "",
+                "instruct": v.get("instruct") or "",
             }
         )
     return out
 
 
-def _cache_key(voice_id, text, speed, rvc_model, pitch):
-    raw = "|".join([voice_id, str(speed), str(rvc_model), str(pitch), text])
+def _engine_variant(engine, entry):
+    """把「同一音色、但会改变音频」的引擎参数并进缓存键。
+
+    CosyVoice 的 mode / instruct / 参考音频直接决定输出，只按
+    voice_id + text + speed 做键时，用户改了情感指令还会命中旧音频，
+    现象就是「instruct 完全不起作用」——其实是被缓存吃了。
+    """
+    if engine != "cosy":
+        return ""
+    cfg = _CFG.get("engines", {}).get("cosy", {})
+    return "|".join(str(entry.get(k) or cfg.get(k) or "")
+                    for k in ("cosy_mode", "instruct", "ref_audio", "prompt_text"))
+
+
+def _cache_key(voice_id, text, speed, rvc_model, pitch, extra=""):
+    raw = "|".join([voice_id, str(speed), str(rvc_model), str(pitch), extra, text])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -422,8 +563,13 @@ def _maybe_cleanup(interval=3600):
         pass
 
 
-def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=True):
-    """返回 {path, ext, mime, engine, rvc, cached, note}"""
+def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=True,
+               instruct=None):
+    """返回 {path, ext, mime, engine, rvc, cached, note}
+
+    instruct 非 None 时覆盖 cosy 音色的语气指令（长文合成页用），
+    并并入缓存键，否则改了指令还会命中旧缓存。
+    """
     key, entry = _voice_entry(voice_id)
     text = (text or "").strip()
     if not text:
@@ -433,8 +579,12 @@ def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=Tru
     pitch = int(pitch if pitch is not None else entry.get("pitch") or 0)
     rvc_cfg = _CFG.get("rvc", {})
     want_rvc = bool(rvc_model) and bool(rvc_cfg.get("enabled"))
+    engine = entry.get("engine", "edge")
 
-    ck = _cache_key(key, text, speed, rvc_model if want_rvc else None, pitch)
+    variant = _engine_variant(engine, entry)
+    if instruct is not None:
+        variant += "|instruct=" + str(instruct)
+    ck = _cache_key(key, text, speed, rvc_model if want_rvc else None, pitch, variant)
     if use_cache and _CFG.get("cache", {}).get("enabled", True):
         for ext in ("mp3", "wav", "ogg", "flac"):
             cand = os.path.join(CACHE_DIR, "%s.%s" % (ck, ext))
@@ -451,7 +601,6 @@ def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=Tru
                 }
 
     stem = os.path.join(CACHE_DIR, ck)
-    engine = entry.get("engine", "edge")
     note = []
 
     if engine == "sapi":
@@ -466,6 +615,30 @@ def synthesize(voice_id, text, speed=1.0, rvc_model=None, pitch=0, use_cache=Tru
         except Exception as exc:
             note.append("GSV 失败，已回退默认音色: %s" % exc)
             _log("[gsv] 合成失败: %s" % exc)
+            path = stem + ".mp3"
+            _edge_synth(text, "zh-CN-XiaoxiaoNeural",
+                        _speed_to_rate(speed), path)
+            ext = "mp3"
+            engine = "edge"
+    elif engine == "higgs":
+        try:
+            path, ext = _higgs_synth(text, entry, speed, stem)
+            if float(speed or 1.0) > 1.4:
+                note.append("Higgs 变速 %.2f 倍偏高，可能有金属味" % float(speed))
+        except Exception as exc:
+            note.append("Higgs 失败，已回退默认音色: %s" % exc)
+            _log("[higgs] 合成失败: %s" % exc)
+            path = stem + ".mp3"
+            _edge_synth(text, "zh-CN-XiaoxiaoNeural",
+                        _speed_to_rate(speed), path)
+            ext = "mp3"
+            engine = "edge"
+    elif engine == "cosy":
+        try:
+            path, ext = _cosy_synth(text, entry, speed, stem, instruct_override=instruct)
+        except Exception as exc:
+            note.append("CosyVoice 失败，已回退默认音色: %s" % exc)
+            _log("[cosy] 合成失败: %s" % exc)
             path = stem + ".mp3"
             _edge_synth(text, "zh-CN-XiaoxiaoNeural",
                         _speed_to_rate(speed), path)

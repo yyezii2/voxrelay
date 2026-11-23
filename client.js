@@ -96,11 +96,31 @@ window.__ModuleLoader__.load({
         return voice.engine === "gsv" ? "gsv" : "tts";
       }
 
+      // 真实引擎标签：把音色归到它所属的引擎名，用于下拉分组和选项后缀
+      const ENGINE_LABEL = {
+        gsv: "GSV", rvc: "RVC", higgs: "Higgs", cosy: "CosyVoice",
+        edge: "系统 TTS", sapi: "系统 TTS", tts: "系统 TTS", system: "系统 TTS",
+      };
+      function engineLabel(voice) {
+        const e = (voice && voice.engine) || "tts";
+        return ENGINE_LABEL[e] || (e === "gsv" ? "GSV" : "系统 TTS");
+      }
+      // 引擎分组顺序（下拉里 optgroup 的先后）
+      const ENGINE_ORDER = ["gsv", "rvc", "higgs", "cosy", "tts"];
+
       function Field(props) {
         return h("div", { style: { marginBottom: 18 } },
           h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 6 } }, props.label),
           props.children,
         );
+      }
+
+      function _inputStyle() {
+        return {
+          width: "100%", padding: "7px 10px", fontSize: 12, color: C.text,
+          background: C.bg, border: "1px solid " + C.line, borderRadius: 6,
+          boxSizing: "border-box",
+        };
       }
 
       function Seg(props) {
@@ -123,7 +143,7 @@ window.__ModuleLoader__.load({
         ));
       }
 
-      const STACK_NAMES = { voicehub: "VoiceHub", gsv: "GSV", rvc: "RVC" };
+      const STACK_NAMES = { voicehub: "VoiceHub", gsv: "GSV", rvc: "RVC", higgs: "Higgs", cosy: "CosyVoice" };
 
       // ---------------- 回合结束自动朗读（不依赖 agent 规则） ----------------
       // 开关仍以 voice_mode.json 的 enabled 为准；这里只解决「谁来触发」。
@@ -608,11 +628,23 @@ window.__ModuleLoader__.load({
         const [voices, setVoices] = React.useState([]);
         const [err, setErr] = React.useState("");
         const [busy, setBusy] = React.useState(false);
+        // 页签：语音 / 长文合成。第二页不用另开侧边栏条目，点页签切换。
+        const [tab, setTab] = React.useState("voice");
         // 「关闭全部服务」要点两下：第一下变成确认态，4 秒不点自动复原，防误触
         const [confirmStop, setConfirmStop] = React.useState(false);
         const [showLoc, setShowLoc] = React.useState(false);
         const [locGsv, setLocGsv] = React.useState("");
         const [locRvc, setLocRvc] = React.useState("");
+        const [locHiggs, setLocHiggs] = React.useState("");
+        const [locCosy, setLocCosy] = React.useState("");
+        // 添加音色（零样本克隆）表单
+        const [showAdd, setShowAdd] = React.useState(false);
+        const [addName, setAddName] = React.useState("");
+        const [addEngine, setAddEngine] = React.useState("cosy");
+        const [addRef, setAddRef] = React.useState("");
+        const [addPrompt, setAddPrompt] = React.useState("");
+        const [addInstruct, setAddInstruct] = React.useState("");
+        const [addDesc, setAddDesc] = React.useState("");
         const [baseInput, setBaseInput] = React.useState(BASE);
         const [showBase, setShowBase] = React.useState(false);
         const locInit = React.useRef(false);
@@ -645,6 +677,8 @@ window.__ModuleLoader__.load({
             if (!locInit.current && m && m.locations) {
               setLocGsv(m.locations.gsv || "");
               setLocRvc(m.locations.rvc || "");
+              setLocHiggs(m.locations.higgs || "");
+              setLocCosy(m.locations.cosy || "");
               locInit.current = true;
             }
           } catch (ex) {
@@ -722,11 +756,42 @@ window.__ModuleLoader__.load({
         const saveLoc = async () => {
           setBusy(true);
           try {
-            await call("/v1/stack", { component: "gsv", path: locGsv });
-            await call("/v1/stack", { component: "rvc", path: locRvc });
+            // 一个组件存一次，接口按 component 校验；四个引擎都要存，
+            // 漏掉哪个，那个引擎就永远用默认目录。
+            const rows = [
+              ["gsv", locGsv], ["rvc", locRvc],
+              ["higgs", locHiggs], ["cosy", locCosy],
+            ];
+            for (const [component, path] of rows) {
+              await call("/v1/stack", { component, path });
+            }
             setErr("");
             setShowLoc(false);
             await load();
+          } catch (ex) {
+            setErr(ex.message);
+          } finally {
+            setBusy(false);
+          }
+        };
+
+        const addVoice = async () => {
+          setBusy(true);
+          try {
+            const body = {
+              name: addName, engine: addEngine, ref_audio: addRef,
+              prompt_text: addPrompt, desc: addDesc,
+            };
+            if (addEngine === "cosy" && addInstruct.trim()) {
+              body.instruct = addInstruct;
+            }
+            const res = await call("/v1/voice", body);
+            setErr("");
+            setShowAdd(false);
+            setAddName(""); setAddRef(""); setAddPrompt(""); setAddInstruct(""); setAddDesc("");
+            await load();
+            // 加完顺手选中它，方便立刻试听
+            if (res && res.id) await send({ voice: res.id });
           } catch (ex) {
             setErr(ex.message);
           } finally {
@@ -813,7 +878,7 @@ window.__ModuleLoader__.load({
             setBusy(true);
             try {
               await hostCall("/voicehub/mode", { enabled: true });
-              setErr("正在拉起语音服务（首次约 1 分钟，GSV 要加载模型）…");
+              setErr("正在启动 VoiceHub 面板…起来后在下面的引擎区选一个（四选一）");
               setTimeout(refreshHost, 2500);
             } catch (ex) {
               setErr("拉起失败：" + ex.message);
@@ -877,7 +942,7 @@ window.__ModuleLoader__.load({
                   background: C.accent, color: "#fff",
                   cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1,
                 },
-              }, enabled ? "重新拉起全套" : "启动语音（全套）"),
+              }, enabled ? "重新启动面板" : "启动语音面板"),
               // 可能只是 VoiceHub 自己掉了、GSV/RVC 还在吃显存，这里给个清干净的口子
               h("button", {
                 onClick: () => {
@@ -951,10 +1016,10 @@ window.__ModuleLoader__.load({
           );
         }
 
-        const engine = mode.engine || "tts";
-        const list = voices.filter((v) => engineOf(v) === engine);
-        const gsvOk = !!(mode.engines && mode.engines.gsv);
-        const ttsOk = !!(mode.engines && mode.engines.tts);
+        // 不再按「GSV / 系统 TTS」过滤音色：引擎改由下面的四选一切换。
+        // 以前按 engine 过滤，GSV 停着的时候列表里只剩 GSV 音色且全是「未就绪」，
+        // 想选系统音色都没有入口，等于把自己锁死。
+        const list = voices;
         const stack = mode.stack || {};
 
         return h("div", {
@@ -964,9 +1029,31 @@ window.__ModuleLoader__.load({
             padding: "28px 32px", fontSize: 14, color: C.text,
           },
         },
-          h("div", { style: { fontSize: 16, fontWeight: 500, marginBottom: 4 } }, "语音"),
-          h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 26 } },
-            "和「打开语音」口令改的是同一份状态，两边自动同步。"),
+          h("div", { style: { display: "flex", gap: 6, marginBottom: 22,
+            borderBottom: "1px solid " + C.line, paddingBottom: 0 } },
+            h("button", {
+              onClick: () => setTab("voice"),
+              style: {
+                padding: "8px 16px", fontSize: 14, border: 0, background: "transparent",
+                cursor: "pointer", color: tab === "voice" ? C.accent : C.dim,
+                borderBottom: "2px solid " + (tab === "voice" ? C.accent : "transparent"),
+                fontWeight: tab === "voice" ? 600 : 400, borderRadius: 0,
+              },
+            }, "语音"),
+            h("button", {
+              onClick: () => setTab("long"),
+              style: {
+                padding: "8px 16px", fontSize: 14, border: 0, background: "transparent",
+                cursor: "pointer", color: tab === "long" ? C.accent : C.dim,
+                borderBottom: "2px solid " + (tab === "long" ? C.accent : "transparent"),
+                fontWeight: tab === "long" ? 600 : 400, borderRadius: 0,
+              },
+            }, "长文合成"),
+          ),
+          tab === "long" ? h(LongPanel) : null,
+          tab === "voice" ? h("div", null,
+            h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 22 } },
+              "和「打开语音」口令改的是同一份状态，两边自动同步。"),
 
           h(Field, { label: "语音模式" },
             h("button", {
@@ -1060,21 +1147,6 @@ window.__ModuleLoader__.load({
             ),
           ),
 
-          h(Field, { label: "引擎" },
-            h(Seg, {
-              items: [
-                { value: "gsv", label: "GSV 角色音色", active: engine === "gsv", disabled: !gsvOk,
-                  hint: gsvOk ? "" : "GPT-SoVITS 没在跑" },
-                { value: "tts", label: "系统 TTS", active: engine === "tts", disabled: !ttsOk,
-                  hint: ttsOk ? "" : "edge-tts 和 SAPI 都不可用" },
-              ],
-              onPick: (value) => send({ engine: value }),
-            }),
-            !gsvOk ? h("div", { style: { fontSize: 12, color: C.dim, marginTop: 8 } },
-              "GSV 不可用：需要 GPT-SoVITS 起在 127.0.0.1:" +
-              ((stack.gsv && stack.gsv.port) || 9880) + "。") : null,
-          ),
-
           h(Field, { label: "音量 / 语速" },
             h("div", { style: { display: "flex", gap: 18 } },
               h("div", { style: { flex: 1 } },
@@ -1109,8 +1181,18 @@ window.__ModuleLoader__.load({
                   flex: 1, padding: "8px 10px", fontSize: 13, color: C.text,
                   background: C.bg, border: "1px solid " + C.line, borderRadius: 8,
                 },
-              }, list.map((v) => h("option", { key: v.id, value: v.id },
-                v.name + (v.ready === false ? "（未就绪）" : "")))),
+              }, ENGINE_ORDER.map((grp) => {
+                const items = list.filter((v) => {
+                  const e = v.engine || "tts";
+                  if (grp === "tts") return !["gsv", "rvc", "higgs", "cosy"].includes(e);
+                  return e === grp;
+                });
+                if (!items.length) return null;
+                const label = grp === "tts" ? "系统 TTS" : ENGINE_LABEL[grp];
+                return h("optgroup", { key: grp, label: label },
+                  items.map((v) => h("option", { key: v.id, value: v.id },
+                    v.name + (v.ready === false ? "（未就绪）" : ""))));
+              })),
               h("button", {
                 onClick: preview,
                 title: "试听当前音色",
@@ -1120,19 +1202,144 @@ window.__ModuleLoader__.load({
                 },
               }, "试听"),
             ),
+            (function () {
+              const cur = list.find((v) => v.id === mode.voice);
+              if (!cur || (cur.engine !== "higgs" && cur.engine !== "cosy")) return null;
+              // 剥掉 CosyVoice 的系统前缀，只留真正有参考价值的台词/指令
+              const strip = function (t) {
+                t = (t || "").trim();
+                const m = t.indexOf("<|endofprompt|>");
+                if (m >= 0) t = t.slice(m + "<|endofprompt|>".length);
+                t = t.replace(/^You are a helpful assistant\.?\s*/i, "").trim();
+                return t;
+              };
+              const pt = strip(cur.prompt_text);
+              const ins = strip(cur.instruct);
+              const line = function (label, text) {
+                if (!text) return null;
+                return h("div", { style: { marginTop: 8, fontSize: 12, lineHeight: "1.6" } },
+                  h("span", { style: { color: C.dim } }, label + "："),
+                  h("span", { style: { color: C.text, wordBreak: "break-all" } }, text),
+                );
+              };
+              return h("div", {
+                style: {
+                  marginTop: 8, padding: "10px 12px", borderRadius: 8,
+                  background: C.bg, border: "1px solid " + C.line,
+                },
+              },
+                h("div", { style: { fontSize: 11, color: C.dim, marginBottom: 2 } },
+                  "语气提示词（合成时作参考，不读出来）"),
+                line("参考音台词", pt),
+                line("语气指令", ins),
+              );
+            })(),
           ),
 
-          h(Field, { label: "三件套" },
-            h("div", { style: { display: "flex", gap: 20 } },
-              ["voicehub", "gsv", "rvc"].map((k) => {
+          h(Field, { label: "添加音色（Higgs / CosyVoice 克隆）" },
+            showAdd ? h("div", { style: { marginTop: 4 } },
+              h("div", { style: { display: "flex", gap: 8, marginBottom: 8 } },
+                h("select", {
+                  value: addEngine,
+                  onChange: (ev) => setAddEngine(ev.target.value),
+                  style: {
+                    flex: 1, padding: "7px 10px", fontSize: 12, color: C.text,
+                    background: C.bg, border: "1px solid " + C.line, borderRadius: 6,
+                  },
+                },
+                  h("option", { value: "cosy" }, "CosyVoice（instruct2，可填语气指令）"),
+                  h("option", { value: "higgs" }, "Higgs（只填参考音台词）"),
+                ),
+                h("button", {
+                  onClick: () => setShowAdd(false),
+                  style: {
+                    padding: "0 12px", fontSize: 12, borderRadius: 6, cursor: "pointer",
+                    border: "1px solid " + C.line, background: C.bg, color: C.dim,
+                  },
+                }, "收起"),
+              ),
+              h("div", { style: { marginBottom: 8 } },
+                h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } }, "音色名"),
+                h("input", {
+                  value: addName, placeholder: "例如：我的克隆音色",
+                  onChange: (ev) => setAddName(ev.target.value),
+                  style: _inputStyle(),
+                }),
+              ),
+              h("div", { style: { marginBottom: 8 } },
+                h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
+                  "参考音频路径（6~10 秒干净人声 .wav）"),
+                h("input", {
+                  value: addRef, placeholder: "D:\\VoiceHub\\...\\ref.wav",
+                  onChange: (ev) => setAddRef(ev.target.value),
+                  style: _inputStyle(),
+                }),
+              ),
+              h("div", { style: { marginBottom: 8 } },
+                h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
+                  "参考音台词（参考音里说的那句话）"),
+                h("input", {
+                  value: addPrompt, placeholder: "参考音里说的那句话",
+                  onChange: (ev) => setAddPrompt(ev.target.value),
+                  style: _inputStyle(),
+                }),
+              ),
+              addEngine === "cosy" ? h("div", { style: { marginBottom: 8 } },
+                h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
+                  "语气指令（可选，CosyVoice 专用）"),
+                h("input", {
+                  value: addInstruct,
+                  placeholder: "例如：请用标准普通话，声音温柔自然，不要带口音",
+                  onChange: (ev) => setAddInstruct(ev.target.value),
+                  style: _inputStyle(),
+                }),
+              ) : null,
+              h("div", { style: { marginBottom: 10 } },
+                h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
+                  "备注（可选）"),
+                h("input", {
+                  value: addDesc, placeholder: "一句话说明这个音色",
+                  onChange: (ev) => setAddDesc(ev.target.value),
+                  style: _inputStyle(),
+                }),
+              ),
+              h("button", {
+                onClick: addVoice,
+                disabled: busy,
+                style: {
+                  padding: "7px 16px", fontSize: 12, borderRadius: 6,
+                  cursor: busy ? "default" : "pointer",
+                  border: "1px solid transparent", background: C.accent, color: "#fff",
+                },
+              }, busy ? "保存中…" : "保存音色"),
+            ) : h("div", { style: { marginTop: 4 } },
+              h("button", {
+                onClick: () => setShowAdd(true),
+                style: {
+                  padding: "6px 14px", fontSize: 12, borderRadius: 6, cursor: "pointer",
+                  border: "1px solid " + C.line, background: C.bg, color: C.text,
+                },
+              }, "+ 添加克隆音色"),
+              h("div", { style: { fontSize: 11, color: C.dim, marginTop: 6, lineHeight: "1.6" } },
+                "给 Higgs / CosyVoice 添加零样本克隆音色：填参考音频 + 参考台词即可，不用手改 config.json。"),
+            ),
+          ),
+
+          h(Field, { label: "引擎（四选一，开一个自动关其他）" },
+            h("div", { style: { display: "flex", gap: 18, flexWrap: "wrap" } },
+              ["voicehub", "gsv", "rvc", "higgs", "cosy"].map((k) => {
                 const s = stack[k] || {};
                 const name = STACK_NAMES[k] || k;
+                const isHub = k === "voicehub";
                 const label = !s.installed ? "未安装" : (s.running ? "运行中" : "未运行");
                 const color = !s.installed ? "#c0392b" : (s.running ? "#1a9e5c" : "#b7791f");
-                return h("div", { key: k, style: { fontSize: 13, color: C.text } },
-                  h("div", { style: { fontWeight: 500 } }, name),
+                return h("div", { key: k, style: { fontSize: 13, color: C.text, minWidth: 62 } },
+                  h("div", { style: { fontWeight: isHub ? 400 : 500 } },
+                    name,
+                    s.port ? h("span", { style: { fontSize: 11, color: C.dim, marginLeft: 4 } },
+                      ":" + s.port) : null),
                   h("div", { style: { fontSize: 12, color } }, label),
-                  k === "voicehub" ? null : h("button", {
+                  isHub ? null : h("button", {
                     onClick: () => svcAction(name, s.running ? "stop" : "start"),
                     disabled: busy || !s.installed,
                     style: {
@@ -1141,7 +1348,7 @@ window.__ModuleLoader__.load({
                       border: "1px solid " + C.line, background: C.bg,
                       color: s.installed ? C.text : C.dim,
                     },
-                  }, s.running ? "停止" : "启动"),
+                  }, s.running ? "停止" : "切到这里"),
                 );
               }),
             ),
@@ -1155,11 +1362,12 @@ window.__ModuleLoader__.load({
               }, showLoc ? "收起" : "设置安装位置"),
             ),
             showLoc ? h("div", { style: { marginTop: 10 } },
-              [["gsv", "GSV"], ["rvc", "RVC"]].map((pair) => {
-                const key = pair[0];
-                const label = pair[1];
-                const val = key === "gsv" ? locGsv : locRvc;
-                const setVal = key === "gsv" ? setLocGsv : setLocRvc;
+              [
+                ["gsv", "GSV", locGsv, setLocGsv],
+                ["rvc", "RVC", locRvc, setLocRvc],
+                ["higgs", "Higgs", locHiggs, setLocHiggs],
+                ["cosy", "CosyVoice", locCosy, setLocCosy],
+              ].map(([key, label, val, setVal]) => {
                 const ph = (mode.model_dirs && mode.model_dirs[key]) || "";
                 return h("div", { key: key, style: { marginBottom: 8 } },
                   h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
@@ -1176,6 +1384,9 @@ window.__ModuleLoader__.load({
                   }),
                 );
               }),
+              h("div", { style: { fontSize: 12, color: C.dim, lineHeight: "1.6", marginBottom: 10 } },
+                "Higgs / CosyVoice 填的是程序目录（含 worker.py 和 venv），不是音色目录；",
+                "它们不扫音色，音色靠 config.json 里的参考音（ref_audio）。"),
               h("button", {
                 onClick: saveLoc,
                 disabled: busy,
@@ -1198,6 +1409,18 @@ window.__ModuleLoader__.load({
               "\\<名字>\\（.pth + .index）",
               h("br"),
               "放好后点下方「重新扫描」即可，不用重启。",
+              h("br"),
+              h("br"),
+              "Higgs / CosyVoice 不用建音色目录：它们是零样本克隆，只要一条 6~10 秒干净人声当参考音。",
+              h("br"),
+              "在 ",
+              h("span", { style: { color: C.text } }, "config.json"),
+              " 的 engines.higgs / engines.cosy 里填 ref_audio（音频路径）和 prompt_text（参考音里说的那句话）。",
+              h("br"),
+              "参考音的语种 = 合成出来口音的语种，想要纯正中文就用中文参考音。",
+              h("br"),
+              h("span", { style: { color: "#b7791f" } },
+                "这两个引擎目前只做到「进程四选一」，还没接进 /v1/audio/speech，选中后仍走原音色。"),
             ),
           ),
 
@@ -1280,6 +1503,165 @@ window.__ModuleLoader__.load({
               }, "连接"),
             ) : null,
           ) : null,
+          ) : null,
+        );
+      }
+
+      // ---------------------------------------------------------------- 长文本合成
+      // 第二个页面：整段文字一次生成一条音频，自动分段 + 拼接 + 下载。
+      // 走服务端的 /v1/long-tts，复用现有 synthesize（缓存/引擎/回退），
+      // 不受 /tts 的 max_chars 限制。
+      function LongPanel() {
+        const [voices, setVoices] = React.useState([]);
+        const [text, setText] = React.useState("");
+        const [voice, setVoice] = React.useState("");
+        const [speed, setSpeed] = React.useState(1.0);
+        const [gap, setGap] = React.useState(200);
+        const [instruct, setInstruct] = React.useState("");
+        const [busy, setBusy] = React.useState(false);
+        const [status, setStatus] = React.useState("");
+        const [audioName, setAudioName] = React.useState("");
+        const [audioUrl, setAudioUrl] = React.useState("");
+
+        const loadVoices = React.useCallback(async () => {
+          try {
+            const d = await call("/v1/audio/voices");
+            setVoices(d.voices || []);
+            if (!voice) {
+              // 默认选「可用」的音色
+              const ok = (d.voices || []).find((v) => v.ready !== false);
+              if (ok) setVoice(ok.id);
+            }
+          } catch (e) {
+            setStatus("加载音色失败：" + e.message);
+          }
+        }, [voice]);
+
+        React.useEffect(() => { loadVoices(); }, []);
+
+        // 当前选中音色是不是 cosy（只有 cosy 支持语气指令）
+        const curVoice = voices.find((v) => v.id === voice) || {};
+        const isCosy = curVoice.engine === "cosy";
+
+        const synth = async () => {
+          const t = (text || "").trim();
+          if (!t) { setStatus("请先输入要合成的文字"); return; }
+          if (!voice) { setStatus("请先选择一个音色"); return; }
+          setBusy(true);
+          setAudioName(""); setAudioUrl("");
+          setStatus("合成中…（Higgs/CosyVoice 首次加载约 10 秒，长文按段生成）");
+          try {
+            const body = {
+              input: t, voice: voice, speed: speed, gap_ms: gap,
+            };
+            if (isCosy && instruct.trim()) body.instruct = instruct.trim();
+            const d = await call("/v1/long-tts", body);
+            setAudioName(d.filename);
+            setAudioUrl("/long-file?name=" + encodeURIComponent(d.filename));
+            setStatus("完成：" + d.filename + " · " + d.seconds + " 秒 · "
+              + d.chunks + " 段 · 引擎 " + (d.engines || []).join("/"));
+          } catch (e) {
+            setStatus("合成失败：" + e.message);
+          } finally {
+            setBusy(false);
+          }
+        };
+
+        return h("div", { style: { padding: "4px 2px" } },
+          h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 6 } }, "音色"),
+          h("select", {
+            value: voice,
+            onChange: (ev) => setVoice(ev.target.value),
+            style: {
+              width: "100%", padding: "8px 10px", fontSize: 13, color: C.text,
+              background: C.bg, border: "1px solid " + C.line, borderRadius: 8,
+              marginBottom: 12, boxSizing: "border-box",
+            },
+          },
+            voices.map((v) => h("option", { key: v.id, value: v.id },
+              v.name + " · " + v.engine + (v.ready === false ? "（不可用）" : "")))),
+          h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 6 } }, "文本"),
+          h("textarea", {
+            value: text,
+            onChange: (ev) => setText(ev.target.value),
+            placeholder: "把要朗读的整段文字粘贴到这里……",
+            style: {
+              width: "100%", height: 180, padding: "10px", fontSize: 13, color: C.text,
+              background: C.bg, border: "1px solid " + C.line, borderRadius: 8,
+              boxSizing: "border-box", resize: "vertical", lineHeight: 1.7,
+              fontFamily: "inherit",
+            },
+          }),
+          h("div", { style: { fontSize: 12, color: C.dim, margin: "12px 0 6px" } },
+            "语速 " + speed.toFixed(2) + "×"),
+          h("input", {
+            type: "range", min: 0.5, max: 2.0, step: 0.05, value: speed,
+            onChange: (ev) => setSpeed(parseFloat(ev.target.value)),
+            style: { width: "100%", margin: 0 },
+          }),
+          h("div", { style: { fontSize: 12, color: C.dim, margin: "12px 0 6px" } },
+            "段间停顿 " + gap + " ms"),
+          h("input", {
+            type: "range", min: 0, max: 800, step: 20, value: gap,
+            onChange: (ev) => setGap(parseInt(ev.target.value, 10)),
+            style: { width: "100%", margin: 0 },
+          }),
+
+          // ---- 语气词辅助：只有 CosyVoice 支持语气指令，其余引擎靠参考音 ----
+          h("div", {
+            style: {
+              marginTop: 16, padding: "12px 14px", borderRadius: 8,
+              background: C.bg, border: "1px solid " + C.line,
+            },
+          },
+            h("div", { style: { fontSize: 13, fontWeight: 500, color: C.text, marginBottom: 8 } },
+              "语气词辅助（可选）"),
+            isCosy ? h("div", null,
+              h("div", { style: { fontSize: 12, color: C.dim, marginBottom: 4 } },
+                "语气指令（CosyVoice instruct2 支持，留空用音色默认）"),
+              h("input", {
+                value: instruct,
+                onChange: (ev) => setInstruct(ev.target.value),
+                placeholder: "例如：请用温柔自然的声音，语速稍慢，句间带一点呼吸感",
+                style: {
+                  width: "100%", padding: "8px 10px", fontSize: 12, color: C.text,
+                  background: C.bg, border: "1px solid " + C.line, borderRadius: 6,
+                  boxSizing: "border-box",
+                },
+              }),
+            ) : h("div", { style: { fontSize: 12, color: C.dim, lineHeight: 1.6 } },
+              "当前音色是 " + (curVoice.engine || "?") + "，不支持语气指令；语气由参考音决定。"),
+            h("div", { style: { fontSize: 11, color: C.dim, marginTop: 10, lineHeight: "1.7" } },
+              h("div", { style: { color: C.text, fontWeight: 500 } }, "各模型语气能力："),
+              h("div", null, "· CosyVoice：支持语气指令（温柔 / 自然 / 带笑意 / 方言 / 语速快慢等），填在上方即可。"),
+              h("div", null, "· Higgs：无语气指令，只有 temperature（随机性）；语气靠参考音的口吻。"),
+              h("div", null, "· GSV：无语气指令；语气靠参考音（ref.wav）和 prompt 文本。"),
+            ),
+          ),
+
+          h("div", { style: { display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" } },
+            h("button", {
+              onClick: synth, disabled: busy,
+              style: {
+                padding: "8px 18px", fontSize: 13, border: 0, borderRadius: 8,
+                background: C.accent, color: "#fff",
+                cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1,
+              },
+            }, busy ? "合成中…" : "开始合成"),
+            audioUrl ? h("a", {
+              href: BASE + audioUrl, download: audioName,
+              style: {
+                padding: "8px 18px", fontSize: 13, borderRadius: 8, textDecoration: "none",
+                border: "1px solid " + C.line, color: C.text, background: C.bg,
+              },
+            }, "下载 WAV") : null,
+          ),
+          status ? h("div", { style: { fontSize: 12, color: C.dim, marginTop: 12, lineHeight: 1.6 } },
+            status) : null,
+          audioUrl ? h("audio", {
+            src: BASE + audioUrl, controls: true,
+            style: { width: "100%", marginTop: 12 },
+          }) : null,
         );
       }
 

@@ -4,7 +4,8 @@
 被 server.py（面板接口）和 mcp_server.py（MCP 工具）共用，
 保证面板上点「启动」和 MCP 里说「打开语音」走的是同一套逻辑。
 
-GSV / RVC 都是可选组件：没装就报「未安装」，不影响主服务本身。
+GSV / RVC / Higgs / CosyVoice 都是可选组件：没装就报「未安装」，不影响主服务本身。
+四个引擎都吃显存，同一时刻只允许一个在跑（见 switch）。
 """
 import json
 import os
@@ -53,6 +54,11 @@ PYRT = _env("PYRT") or _first_existing(
     os.path.join(".venv", "Scripts", "python.exe"),
 )
 
+# Higgs / CosyVoice 跑在各自的 venv 里（torch 版本和 GSV 那套不一定一致，
+# 而且它们的依赖比 GSV 轻得多，混用一个环境容易互相顶掉）。
+PY_HIGGS = _env("HIGGS_PY") or os.path.join(ROOT, "higgs", "venv", "Scripts", "python.exe")
+PY_COSY = _env("COSY_PY") or os.path.join(ROOT, "cosyvoice", "venv", "Scripts", "python.exe")
+
 
 # ---------------------------------------------------------------- 端口从 config 来
 # 端口只在一处定义（config.json），这里读出来还原成服务的监听参数。
@@ -88,6 +94,14 @@ GSV_HOST, GSV_PORT = _endpoint(
     ((_CFG.get("engines") or {}).get("gsv") or {}).get("base_url"), "127.0.0.1", 9880)
 RVC_HOST, RVC_PORT = _endpoint(
     (_CFG.get("rvc") or {}).get("worker"), "127.0.0.1", 8790)
+HIGGS_HOST, HIGGS_PORT = _endpoint(
+    ((_CFG.get("engines") or {}).get("higgs") or {}).get("base_url"), "127.0.0.1", 8791)
+COSY_HOST, COSY_PORT = _endpoint(
+    ((_CFG.get("engines") or {}).get("cosy") or {}).get("base_url"), "127.0.0.1", 8789)
+
+# 四个吃显存的引擎，同一时刻只允许一个在跑。
+# 主服务是路由器，自己不占显存，不在组内。
+GPU_GROUP = ("GSV", "RVC", "Higgs", "CosyVoice")
 SELF_PORT = int(_CFG.get("port") or 8787)
 
 SERVICES = [
@@ -127,7 +141,43 @@ SERVICES = [
         "optional": True,
         "self": False,
     },
+    {
+        "name": "Higgs",
+        "port": HIGGS_PORT,
+        "cwd": os.path.join(ROOT, "higgs"),
+        # worker 只认 --port（监听 127.0.0.1），和 GSV/RVC 的 --host 不同
+        "cmd": [PY_HIGGS, "worker.py", "--port", str(HIGGS_PORT)],
+        "entry_name": "worker.py",
+        "entry": os.path.join(ROOT, "higgs", "worker.py"),
+        "extra_path": None,
+        "optional": True,
+        "self": False,
+    },
+    {
+        "name": "CosyVoice",
+        "port": COSY_PORT,
+        "cwd": os.path.join(ROOT, "cosyvoice"),
+        "cmd": [PY_COSY, "worker.py", "--port", str(COSY_PORT)],
+        "entry_name": "worker.py",
+        "entry": os.path.join(ROOT, "cosyvoice", "worker.py"),
+        "extra_path": None,
+        "optional": True,
+        "self": False,
+        # stack.json 里的键。服务名是 CosyVoice，但 config 和面板都用 cosy，
+        # 不显式指定的话 resolve() 会按名字推成 "cosyvoice"，两边永远对不上，
+        # 结果就是「设置了安装位置但不生效」。
+        "stack_key": "cosy",
+    },
 ]
+
+
+def stack_key(svc):
+    """这个服务在 stack.json 里的键。"""
+    return svc.get("stack_key") or svc["name"].lower()
+
+
+# 允许写进 stack.json 的组件名，直接由服务清单推出来，加引擎不用再改 server。
+STACK_COMPONENTS = tuple(stack_key(s) for s in SERVICES if not s.get("self"))
 
 
 # ---------------------------------------------------------------- 安装位置
@@ -148,8 +198,8 @@ def _stack():
 
 
 def resolve(svc):
-    """返回 (cwd, entry)。用户给 GSV/RVC 指过目录就用那个目录。"""
-    loc = _stack().get(svc["name"].lower())
+    """返回 (cwd, entry)。用户给这个组件指定过目录就用那个目录。"""
+    loc = _stack().get(stack_key(svc))
     if loc and os.path.isdir(loc):
         return loc, os.path.join(loc, svc.get("entry_name") or "")
     return svc["cwd"], svc["entry"]
@@ -201,7 +251,13 @@ def set_self_port(port):
 
 # ---------------------------------------------------------------- 状态与就绪
 
-def port_open(port, timeout=0.4):
+def port_open(port, timeout=0.15):
+    """端口是否在监听。
+
+    timeout 别调大：本地回环上未监听的端口要么立刻 RST，要么被防火墙静默丢弃，
+    后者会一直阻塞到超时。面板每次刷新要探测 5 个端口，0.4 秒 ×5 就是 2 秒空白。
+    0.15 秒足够本地回环往返（实测 <1ms）。
+    """
     try:
         with socket.socket() as s:
             s.settimeout(timeout)
@@ -327,9 +383,15 @@ def _stop_impl(name, wait=20):
 
 
 def stop(name, wait=20):
-    """对外的停止入口：先拿锁再执行。"""
-    with service_lock("stop:%s" % name):
-        return _stop_impl(name, wait)
+    """对外的停止入口：先拿锁再执行。
+
+    停止前把意图写成 off，否则自愈会在 15 秒后把刚停的服务又拉回来
+    （面板上点「停止」却停不掉，就是这个原因）。
+    """
+    svc = get(name)
+    with service_lock("stop:%s" % svc["name"]):
+        set_intent(svc["name"], False)
+        return _stop_impl(svc["name"], wait)
 
 
 def restart(name, wait=90):
@@ -338,6 +400,80 @@ def restart(name, wait=90):
         _stop_impl(name)
         time.sleep(0.5)
         return _start_impl(name, wait=wait)
+
+
+# ---------------------------------------------------------------- 四选一互斥
+# 四个吃显存的引擎同一时刻只允许一个在跑。切换时先停其他、等端口释放，
+# 再启目标——宁可切换慢几秒，也不让两个模型同时抢 16GB 显存。
+
+def gpu_free_gb():
+    """剩余显存（GB）。读不到返回 None，不阻断切换。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=0x08000000 if IS_WIN else 0,  # CREATE_NO_WINDOW
+        )
+        line = (out.stdout or "").strip().splitlines()[0]
+        return round(int(line.strip()) / 1024.0, 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def running_engines():
+    """互斥组里当前在跑的服务名（正常情况最多一个）。"""
+    return [s["name"] for s in SERVICES
+            if s["name"] in GPU_GROUP and port_open(s["port"])]
+
+
+def switch(name, wait=120):
+    """四选一：启动目标引擎，并把同组其余服务全部停掉。
+
+    返回 {ok, name, stopped, stop_failed, free_gb, free_gb_before_start, note|error}。
+    注意互斥是硬性的：即使目标启动失败，其他引擎也已经停了，
+    调用方拿到 ok=False 时要自己决定切回哪个。
+    """
+    target = get(name)
+    if target.get("self"):
+        return {"ok": False, "name": target["name"], "error": "主服务自身不参与四选一"}
+    if target["name"] not in GPU_GROUP:
+        return {"ok": False, "name": target["name"], "error": "不在互斥组内"}
+
+    with service_lock("switch:%s" % target["name"]):
+        # 意图必须最先落盘。启动一个引擎要 7~40 秒，在这段时间里自愈线程
+        # （每 15 秒一轮）如果读到旧意图，就会把刚停掉的引擎拉回来——
+        # 表现为「切过去之后过了一会儿，原来那个又自己起来了」。
+        for gname in GPU_GROUP:
+            set_intent(gname, gname == target["name"])
+
+        stopped = []
+        failed = []
+        for other in SERVICES:
+            if other["name"] in GPU_GROUP and other["name"] != target["name"]:
+                if port_open(other["port"]):
+                    res = _stop_impl(other["name"])
+                    (stopped if res.get("ok") else failed).append(other["name"])
+
+        # 等整组都空下来（_stop_impl 各自等过端口，这里兜底一次总确认）
+        deadline = time.time() + 20
+        while time.time() < deadline and running_engines():
+            time.sleep(0.5)
+
+        free = gpu_free_gb()
+        res = _start_impl(target["name"], wait=wait)
+        # 兜底清扫：切换期间可能有外部动作（计划任务、面板手点、上一轮自愈）
+        # 又把别的引擎拉起，这里再停一次，保证返回时组内只剩目标一个。
+        for other in SERVICES:
+            if (other["name"] in GPU_GROUP and other["name"] != target["name"]
+                    and port_open(other["port"])):
+                sweep = _stop_impl(other["name"])
+                if sweep.get("ok") and other["name"] not in stopped:
+                    stopped.append(other["name"])
+        res["stopped"] = stopped
+        res["stop_failed"] = failed
+        res["free_gb"] = gpu_free_gb()
+        res["free_gb_before_start"] = free
+        return res
 
 
 # ---------------------------------------------------------------- 自愈意图
@@ -378,6 +514,20 @@ def heal_once(state):
     intent = read_intent()
     healed = []
     now = time.time()
+
+    # 互斥守护：组内只能有一个在跑，多出来的一律停掉，保留 intent=on 的那个。
+    # 这样即使还有旧版入口（没重启的 MCP、手写的 bat）把全套拉起来，
+    # 也会在 15 秒内被纠正，不用等所有调用方都升级。
+    live = running_engines()
+    if len(live) > 1:
+        keep = next((n for n in live if intent.get(n) == "on"), live[0])
+        for other in live:
+            if other == keep:
+                continue
+            res = _stop_impl(other)
+            healed.append({"name": other, "ok": res.get("ok"),
+                           "note": "互斥：为 %s 让出显存" % keep})
+
     for svc in SERVICES:
         name = svc["name"]
         if svc.get("self"):
@@ -390,6 +540,10 @@ def heal_once(state):
             continue
         last = state.setdefault(name, {"was_up": False, "last_try": 0.0})
         if intent.get(name, "on") != "on":
+            continue
+        # 互斥组里已经有别的引擎在跑 → 不自愈，否则两个会同时占显存，
+        # 16GB 的卡上 Higgs（9.3GB）和 GSV（5.8GB）一撞就是 OOM。
+        if name in GPU_GROUP and [n for n in running_engines() if n != name]:
             continue
         if not last.get("was_up"):
             continue

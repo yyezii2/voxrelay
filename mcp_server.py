@@ -486,6 +486,24 @@ def _start_services_impl(wait=180):
         else:
             skipped.append((svc["name"], why))
 
+    # 引擎四选一：一次只起一个。
+    # 以前这里把三个服务全拉起来；加上 Higgs(9.3GB) / CosyVoice(3.5GB) 之后，
+    # 四个引擎一起加载要 21GB，16GB 的卡直接 OOM。
+    # 选「上次用的那个」（intent=on）：面板切过一次之后，下次「打开 mod1」
+    # 恢复的还是同一个引擎，不会每次跳回 GSV。
+    intent = VS.read_intent()
+    engines = [s for s in ready if s["name"] in VS.GPU_GROUP]
+    chosen = None
+    # 已经有引擎在跑（面板刚切过）就一个都不起，否则又变成两个引擎抢显存
+    if not VS.running_engines():
+        # 优先「上次用的那个」；一个都没标记时退回第一个（通常是 GSV），保证能出声
+        chosen = next((s for s in engines if intent.get(s["name"]) == "on"),
+                      engines[0] if engines else None)
+    for svc in ready:
+        if svc["name"] in VS.GPU_GROUP and svc is not chosen:
+            skipped.append((svc["name"], "四选一：本次不启动（要切就点面板）"))
+    ready = [s for s in ready if s["name"] not in VS.GPU_GROUP or s is chosen]
+
     if ready and all(_port_open(s["port"]) for s in ready):
         return [], [], skipped
 
@@ -752,7 +770,7 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "voxrelay", "version": "0.2.0"},
+            "serverInfo": {"name": "voxrelay", "version": "0.3.0"},
             # 规则随握手下发：有面板的客户端让面板念，没有的让模型调 speak
             "instructions": _instructions_for(params),
         }}

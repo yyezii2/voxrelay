@@ -105,26 +105,98 @@ def main():
         def mode():
             _, data = call(base, "/v1/mode")
             need = {"enabled", "voice", "engine", "speed", "volume", "stack",
-                    "locations", "model_dirs"}
+                    "locations", "model_dirs", "engines", "engine_group",
+                    "running_engine"}
             missing = need - set(data)
             assert not missing, "缺字段: %s" % ", ".join(sorted(missing))
             assert data["stack"], "stack 是空的"
-            return "engine=%s voice=%s" % (data["engine"], data["voice"])
+            assert set(data["engine_group"]) == {"GSV", "RVC", "Higgs", "CosyVoice"}, \
+                "互斥组不对: %s" % data["engine_group"]
+            # 安装位置要覆盖四个引擎，少一个那个引擎就只能用默认目录
+            dirs = set(data.get("model_dirs") or {})
+            assert {"gsv", "rvc", "higgs", "cosy"} <= dirs, \
+                "model_dirs 缺: %s" % ", ".join(sorted({"gsv", "rvc", "higgs", "cosy"} - dirs))
+            # 端口只能来自 config：四个引擎都得有值，且和 stack 里的端口一致
+            ports = data.get("engine_ports") or {}
+            assert set(ports) == {"GSV", "RVC", "Higgs", "CosyVoice"}, "engine_ports 不全: %s" % ports
+            alias = {"GSV": "gsv", "RVC": "rvc", "Higgs": "higgs", "CosyVoice": "cosy"}
+            for name, port in ports.items():
+                assert isinstance(port, int) and port > 0, "%s 端口异常: %r" % (name, port)
+                assert port == data["stack"][alias[name]]["port"], \
+                    "%s 的 engine_ports 和 stack 对不上" % name
+            return "engine=%s voice=%s ports=%s" % (
+                data["engine"], data["voice"], ",".join(str(p) for p in ports.values()))
         check("/v1/mode 字段完整", mode)
 
         def stack():
             _, data = call(base, "/v1/stack")
-            assert set(data.get("stack") or {}) == {"voicehub", "gsv", "rvc"}, \
-                "三件套不全: %s" % data.get("stack")
+            need = {"voicehub", "gsv", "rvc", "higgs", "cosy"}
+            got = set(data.get("stack") or {})
+            assert need <= got, "服务状态不全: 缺 %s" % ", ".join(sorted(need - got))
             return "voicehub 端口 %s" % data["stack"]["voicehub"]["port"]
-        check("/v1/stack 三件套齐全", stack)
+        check("/v1/stack 五个组件齐全", stack)
 
         def services():
             _, data = call(base, "/v1/services")
             names = set((data.get("services") or {}).keys())
-            assert {"VoxRelay", "GSV", "RVC"} <= names, "缺服务: %s" % names
+            assert {"VoxRelay", "GSV", "RVC", "Higgs", "CosyVoice"} <= names, \
+                "缺服务: %s" % names
             return " / ".join(sorted(names))
         check("/v1/services 正常", services)
+
+        def engine_guard():
+            # 四选一只能选互斥组内的引擎；主服务和未知名字都必须被拒，
+            # 否则面板传错一个参数就把线上引擎全停了。
+            for bad in ("VoxRelay", "NoSuchEngine"):
+                try:
+                    call(base, "/v1/engine", {"name": bad})
+                except urllib.error.HTTPError as exc:
+                    assert exc.code in (400, 500), "%s 应该被拒，实际 %d" % (bad, exc.code)
+                    continue
+                raise AssertionError("%s 竟然被接受了" % bad)
+            return "主服务 / 未知引擎均被拒"
+        check("/v1/engine 拒绝越界", engine_guard)
+
+        def stack_guard():
+            # 安装位置只认服务清单里的组件，别的一律拒——否则会往 stack.json
+            # 里写没用的键，看着「设置了」其实永远不生效。
+            # 只测拒绝分支，避免在仓库目录里真的写出 stack.json。
+            try:
+                call(base, "/v1/stack", {"component": "calc.exe", "path": ""})
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400, "应该 400，实际 %d" % exc.code
+                return "未知组件被拒"
+            raise AssertionError("未知组件竟然被接受了")
+        check("/v1/stack 拒绝未知组件", stack_guard)
+
+        def voice_add_guard():
+            # 添加音色只认 higgs/cosy，别的引擎一律拒；空 body 也应给参数错误。
+            # 只测拒绝分支，避免在仓库目录里真的写出 config.json。
+            try:
+                call(base, "/v1/voice", {"name": "x", "engine": "gsv",
+                                         "ref_audio": "/nonexist.wav",
+                                         "prompt_text": "hi"})
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400, "应该 400，实际 %d" % exc.code
+                return "非 higgs/cosy 引擎被拒"
+            raise AssertionError("gsv 引擎竟然被接受了")
+        check("/v1/voice 拒绝非克隆引擎", voice_add_guard)
+
+        def voice_delete_guard():
+            # 删除只认 custom- 前缀，内置音色一律拒。
+            try:
+                call(base, "/v1/voice/delete", {"id": "xiaoxiao"})
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400, "应该 400，实际 %d" % exc.code
+                return "内置音色删除被拒"
+            raise AssertionError("内置音色竟然可删")
+        check("/v1/voice/delete 拒删内置音色", voice_delete_guard)
+
+        def long_page():
+            code, body, _ctype = call(base, "/long", raw=True)
+            assert code == 200 and "长文本".encode("utf-8") in body, "/long 页面异常"
+            return "长文页可访问"
+        check("/long 页面可访问", long_page)
 
         def rescan():
             _, data = call(base, "/v1/rescan", {}, timeout=120)

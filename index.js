@@ -42,9 +42,11 @@ const MODE_PATH = "/voicehub/mode";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-// 只允许操作这三个组件、这三种动作。宿主能起进程，边界必须写死。
-const ALLOWED_NAMES = ["GSV", "VoiceHub", "RVC"];
+// 只允许操作这些组件、这三种动作。宿主能起进程，边界必须写死。
+const ALLOWED_NAMES = ["GSV", "VoiceHub", "RVC", "Higgs", "CosyVoice"];
 const ALLOWED_ACTIONS = ["start", "stop", "restart"];
+// 这四个吃显存，四选一互斥；「启动」要走 switch（会先停掉同组其他引擎）。
+const ENGINE_NAMES = ["GSV", "RVC", "Higgs", "CosyVoice"];
 
 /**
  * 服务目录候选。按顺序找第一个带 config.json 的：
@@ -235,9 +237,12 @@ function runBackground(home, code) {
 }
 
 function serviceCode(component, action) {
+  // 引擎的「启动」走 switch：它会先停掉同组其他引擎再启目标，保证显存里只有一个。
+  // 用 start 会有两个引擎并存（各自占 3~9GB），16GB 的卡扛不住。
+  const fn = (action === "start" && ENGINE_NAMES.indexOf(component) >= 0) ? "switch" : action;
   return [
     "import voice_services as V",
-    "r = V." + action + "(" + JSON.stringify(component) + ")",
+    "r = V." + fn + "(" + JSON.stringify(component) + ")",
   ].join("\n");
 }
 

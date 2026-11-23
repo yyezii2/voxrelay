@@ -79,6 +79,18 @@ check("回合尾部朗读组件已注册", () => {
   assert(names.includes("sidebar.panellist"), "缺少 sidebar.panellist");
 });
 
+check("第二页（长文合成）在面板内切换", () => {
+  const mains = registered.filter((r) => r && r.name === "main");
+  const panels = registered.filter((r) => r && r.name === "sidebar.panellist");
+  assert(mains.length === 1, "main 应该只有一个（页签在内部切换），实际 " + mains.length);
+  assert(panels.length === 1, "侧边栏应该只有一个条目，实际 " + panels.length);
+  // 页签切换由 LongPanel 组件 + tab 状态实现，源码里必须存在
+  assert(code.indexOf("长文合成") >= 0, "面板里没有「长文合成」页签");
+  assert(code.indexOf("function LongPanel") >= 0, "缺少 LongPanel 组件");
+  assert(code.indexOf('setTab("long")') >= 0, "缺少切换到长文的页签逻辑");
+  return "单条目 + 内部页签";
+});
+
 const T = exportsObj.__test;
 check("纯函数已导出给自检", () => {
   assert(T && typeof T.turnTime === "function" && typeof T.turnIdentity === "function", "缺少 __test");
@@ -183,6 +195,59 @@ check("turn-tail 缺失时退回 assistant-step", () => {
   const info = T.extractReplyInfo(stepTurn);
   assert(info.text === finalText, `意外正文: ${info.text}`);
   assert(info.source === "assistant-step:0", `意外来源: ${info.source}`);
+});
+
+// 面板结构回归：React 在这里是空桩，拿不到渲染树，所以直接看源码。
+// 这两条守的是「别再退回二选一」和「加了新引擎别忘了写进说明」。
+check("面板不再有 GSV / 系统 TTS 二选一", () => {
+  assert(code.indexOf('label: "GSV 角色音色"') < 0, "旧的 GSV 角色音色按钮又回来了");
+  assert(code.indexOf('label: "系统 TTS"') < 0, "旧的系统 TTS 按钮又回来了");
+  assert(code.indexOf("const list = voices;") >= 0, "音色列表不该再按 engine 过滤");
+});
+
+check("怎么加新模型覆盖四个引擎", () => {
+  const at = code.indexOf('label: "怎么加新模型"');
+  assert(at >= 0, "找不到「怎么加新模型」");
+  const block = code.slice(at, at + 1600);
+  for (const key of ["models\\\\gsv", "models\\\\rvc", "engines.higgs", "engines.cosy"]) {
+    assert(block.indexOf(key) >= 0, `说明里缺 ${key}`);
+  }
+});
+
+// 端口只能来自 config.json：面板一旦写死端口，用户改了配置就会出现
+// 「服务起来了但面板说没起」，这是这个项目踩过的老坑，用断言守住。
+check("面板不硬编码引擎端口", () => {
+  for (const port of ["9880", "8790", "8791", "8789"]) {
+    assert(code.indexOf(port) < 0, `面板里又出现写死的端口 ${port}`);
+  }
+  assert(code.indexOf("stack[k]") >= 0 || code.indexOf("s.port") >= 0, "端口应从 stack 动态取");
+});
+
+check("选中 higgs/cosy 音色时显示语气提示词", () => {
+  assert(code.indexOf("语气提示词") >= 0, "缺少「语气提示词」展示块");
+  assert(code.indexOf("prompt_text") >= 0, "语气块没读音色的 prompt_text");
+  assert(code.indexOf("instruct") >= 0, "语气块没读音色的 instruct");
+  assert(code.indexOf("endofprompt") >= 0, "未剥离 CosyVoice 的 <|endofprompt|> 系统前缀");
+});
+
+check("音色下拉按引擎分组（optgroup）", () => {
+  assert(code.indexOf("optgroup") >= 0, "音色下拉没用 optgroup 分组");
+  assert(code.indexOf("ENGINE_ORDER") >= 0, "缺少引擎分组顺序定义");
+  assert(code.indexOf("ENGINE_LABEL") >= 0, "缺少引擎标签映射");
+});
+
+check("提供添加克隆音色的入口", () => {
+  assert(code.indexOf("添加音色") >= 0 || code.indexOf("添加克隆音色") >= 0, "缺少添加音色入口");
+  assert(code.indexOf("/v1/voice") >= 0, "没有调用 /v1/voice 接口");
+  assert(code.indexOf("ref_audio") >= 0, "添加表单没填参考音频 ref_audio");
+});
+
+check("长文合成页带语气词辅助", () => {
+  assert(code.indexOf("语气词辅助") >= 0, "长文合成页缺少「语气词辅助」区");
+  assert(code.indexOf("各模型语气能力") >= 0, "缺少各模型语气能力说明");
+  // 长文合成传 instruct 给后端（仅 cosy 音色）
+  assert(code.indexOf("body.instruct") >= 0 || code.indexOf("instruct.trim()") >= 0,
+    "长文合成没把 instruct 传给 /v1/long-tts");
 });
 
 const ok = results.every(Boolean);
